@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Configure CMake
+        run: cmake -S . -B build
+
+      - name: Build
+        run: cmake --build build -j 2
+
+      - name: Python syntax check
+        run: python3 -m py_compile scripts/validate_llama_cli.py
+
+      - name: Smoke benchmark
+        run: ./build/turboquant-bench --dim 128 --bits 4 --qjl-dim 128 --samples 16 --queries 4
+

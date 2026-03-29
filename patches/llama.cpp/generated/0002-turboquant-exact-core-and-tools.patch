@@ -1,0 +1,3347 @@
+diff --git a/common/turboquant.h b/common/turboquant.h
+new file mode 100644
+index 0000000..a2a6645
+--- /dev/null
++++ b/common/turboquant.h
+@@ -0,0 +1,109 @@
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace llama_lab {
++
++struct turboquant_recipe_config {
++    std::string name = "manual";
++    int bits = 4;
++    int qjl_dim = 0;
++    int outlier_channels = 0;
++};
++
++struct turboquant_init_params {
++    int dim = 128;
++    int bits = 4;
++    int qjl_dim = 0;
++    int outlier_channels = 0;
++    uint64_t seed = 42;
++    int codebook_iters = 96;
++    int codebook_grid = 4096;
++};
++
++struct turboquant_mse_compressed {
++    std::vector<uint16_t> indices;
++    float vec_norm = 1.0f;
++};
++
++struct turboquant_prod_compressed {
++    turboquant_mse_compressed mse;
++    std::vector<int8_t> qjl_signs;
++    float residual_norm = 0.0f;
++    std::vector<uint16_t> outlier_indices;
++    std::vector<float> outlier_values;
++};
++
++struct turboquant_metrics {
++    double mse_mean = 0.0;
++    double mse_max = 0.0;
++    double ip_bias_mean = 0.0;
++    double ip_rmse = 0.0;
++    double ip_mae = 0.0;
++};
++
++class turboquant_mse {
++public:
++    explicit turboquant_mse(const turboquant_init_params & params);
++
++    int dim() const;
++    int bits() const;
++
++    turboquant_mse_compressed quantize(const std::vector<float> & x) const;
++    std::vector<float> dequantize(const turboquant_mse_compressed & compressed) const;
++
++    const std::vector<float> & centroids() const;
++    const std::vector<float> & boundaries() const;
++
++private:
++    turboquant_init_params params_;
++    std::vector<float> rotation_;
++    std::vector<float> centroids_;
++    std::vector<float> boundaries_;
++
++    std::vector<float> rotate_unit(const std::vector<float> & x) const;
++    std::vector<float> unrotate_unit(const std::vector<float> & y) const;
++};
++
++class turboquant_prod {
++public:
++    explicit turboquant_prod(const turboquant_init_params & params);
++
++    int dim() const;
++    int bits() const;
++    int qjl_dim() const;
++    int outlier_channels() const;
++
++    turboquant_prod_compressed quantize(const std::vector<float> & x) const;
++    turboquant_prod_compressed quantize(
++            const std::vector<float> & x,
++            const std::vector<uint16_t> & forced_outlier_indices) const;
++    std::vector<float> dequantize(const turboquant_prod_compressed & compressed) const;
++    double inner_product(const std::vector<float> & q, const turboquant_prod_compressed & compressed) const;
++    const turboquant_mse & mse_quantizer() const;
++    const std::vector<float> & qjl_matrix() const;
++
++private:
++    turboquant_init_params params_;
++    turboquant_mse mse_;
++    std::vector<float> qjl_matrix_;
++};
++
++std::vector<float> turboquant_make_unit_vector(int dim, uint64_t seed, uint64_t sample_idx);
++turboquant_metrics turboquant_score_mse(
++        const turboquant_mse & quantizer,
++        const std::vector<std::vector<float>> & dataset);
++turboquant_metrics turboquant_score_mse_inner_products(
++        const turboquant_mse & quantizer,
++        const std::vector<std::vector<float>> & dataset,
++        const std::vector<std::vector<float>> & queries);
++turboquant_metrics turboquant_score_prod(
++        const turboquant_prod & quantizer,
++        const std::vector<std::vector<float>> & dataset,
++        const std::vector<std::vector<float>> & queries);
++std::string turboquant_metrics_json(const turboquant_metrics & metrics);
++turboquant_recipe_config turboquant_recipe_for_name(const std::string & name, int dim);
++
++} // namespace llama_lab
+diff --git a/common/turboquant.cpp b/common/turboquant.cpp
+new file mode 100644
+index 0000000..f50f761
+--- /dev/null
++++ b/common/turboquant.cpp
+@@ -0,0 +1,636 @@
++#include "turboquant.h"
++
++#include <algorithm>
++#include <cctype>
++#include <cmath>
++#include <iomanip>
++#include <numeric>
++#include <random>
++#include <sstream>
++#include <stdexcept>
++#include <utility>
++
++namespace llama_lab {
++
++namespace {
++
++constexpr double kPi = 3.14159265358979323846;
++
++static float dot_product(const std::vector<float> & a, const std::vector<float> & b) {
++    float acc = 0.0f;
++    for (size_t i = 0; i < a.size(); ++i) {
++        acc += a[i] * b[i];
++    }
++    return acc;
++}
++
++static float l2_norm(const std::vector<float> & x) {
++    return std::sqrt(std::max(0.0f, dot_product(x, x)));
++}
++
++static std::vector<float> normalize_vector(const std::vector<float> & x, float & norm_out) {
++    std::vector<float> y = x;
++    norm_out = l2_norm(y);
++    if (norm_out <= 0.0f) {
++        norm_out = 1.0f;
++        return y;
++    }
++    for (float & v : y) {
++        v /= norm_out;
++    }
++    return y;
++}
++
++static std::vector<float> matvec_rows(const std::vector<float> & m, int rows, int cols, const std::vector<float> & x) {
++    std::vector<float> out(rows, 0.0f);
++    for (int r = 0; r < rows; ++r) {
++        float acc = 0.0f;
++        const int base = r * cols;
++        for (int c = 0; c < cols; ++c) {
++            acc += m[base + c] * x[c];
++        }
++        out[r] = acc;
++    }
++    return out;
++}
++
++static std::vector<float> matvec_cols(const std::vector<float> & m, int rows, int cols, const std::vector<float> & x) {
++    std::vector<float> out(cols, 0.0f);
++    for (int r = 0; r < rows; ++r) {
++        const float xr = x[r];
++        const int base = r * cols;
++        for (int c = 0; c < cols; ++c) {
++            out[c] += xr * m[base + c];
++        }
++    }
++    return out;
++}
++
++static std::vector<float> build_rotation_matrix(int dim, uint64_t seed) {
++    std::mt19937_64 rng(seed);
++    std::normal_distribution<float> normal(0.0f, 1.0f);
++
++    std::vector<float> q(dim * dim, 0.0f);
++
++    for (int r = 0; r < dim; ++r) {
++        for (int c = 0; c < dim; ++c) {
++            q[r * dim + c] = normal(rng);
++        }
++    }
++
++    // Modified Gram-Schmidt over rows.
++    for (int i = 0; i < dim; ++i) {
++        for (int j = 0; j < i; ++j) {
++            float proj = 0.0f;
++            for (int c = 0; c < dim; ++c) {
++                proj += q[i * dim + c] * q[j * dim + c];
++            }
++            for (int c = 0; c < dim; ++c) {
++                q[i * dim + c] -= proj * q[j * dim + c];
++            }
++        }
++        float nrm = 0.0f;
++        for (int c = 0; c < dim; ++c) {
++            nrm += q[i * dim + c] * q[i * dim + c];
++        }
++        nrm = std::sqrt(std::max(nrm, 1e-12f));
++        for (int c = 0; c < dim; ++c) {
++            q[i * dim + c] /= nrm;
++        }
++    }
++
++    return q;
++}
++
++static std::vector<float> build_gaussian_matrix(int rows, int cols, uint64_t seed) {
++    std::mt19937_64 rng(seed);
++    std::normal_distribution<float> normal(0.0f, 1.0f);
++    std::vector<float> m(rows * cols);
++    for (float & v : m) {
++        v = normal(rng);
++    }
++    return m;
++}
++
++static std::vector<float> solve_lloyd_max_centroids(int dim, int bits, int iterations, int grid_size) {
++    if (bits < 1 || bits > 15) {
++        throw std::invalid_argument("TurboQuant bits must be between 1 and 15");
++    }
++    const int n_levels = 1 << bits;
++    const double sigma = 1.0 / std::sqrt(std::max(dim, 1));
++    const double lo = -6.0 * sigma;
++    const double hi = 6.0 * sigma;
++    const double step = (hi - lo) / std::max(grid_size - 1, 1);
++
++    std::vector<double> xs(grid_size);
++    std::vector<double> pdf(grid_size);
++    const double coeff = 1.0 / (std::sqrt(2.0 * kPi) * sigma);
++    for (int i = 0; i < grid_size; ++i) {
++        const double x = lo + step * i;
++        xs[i] = x;
++        pdf[i] = coeff * std::exp(-(x * x) / (2.0 * sigma * sigma));
++    }
++
++    std::vector<double> centroids(n_levels);
++    for (int i = 0; i < n_levels; ++i) {
++        centroids[i] = lo + (hi - lo) * (double(i) + 0.5) / double(n_levels);
++    }
++
++    std::vector<double> boundaries(std::max(0, n_levels - 1));
++    for (int iter = 0; iter < iterations; ++iter) {
++        for (int i = 0; i + 1 < n_levels; ++i) {
++            boundaries[i] = 0.5 * (centroids[i] + centroids[i + 1]);
++        }
++
++        std::vector<double> next = centroids;
++        for (int level = 0; level < n_levels; ++level) {
++            const double a = (level == 0) ? lo : boundaries[level - 1];
++            const double b = (level + 1 == n_levels) ? hi : boundaries[level];
++            double num = 0.0;
++            double den = 0.0;
++            for (int i = 0; i < grid_size; ++i) {
++                const double x = xs[i];
++                if (x < a || x > b) {
++                    continue;
++                }
++                const double w = pdf[i];
++                num += x * w;
++                den += w;
++            }
++            if (den > 1e-12) {
++                next[level] = num / den;
++            }
++        }
++
++        double max_delta = 0.0;
++        for (int i = 0; i < n_levels; ++i) {
++            max_delta = std::max(max_delta, std::abs(next[i] - centroids[i]));
++        }
++        centroids.swap(next);
++        if (max_delta < 1e-10) {
++            break;
++        }
++    }
++
++    std::vector<float> out(n_levels);
++    for (int i = 0; i < n_levels; ++i) {
++        out[i] = static_cast<float>(centroids[i]);
++    }
++    return out;
++}
++
++static std::vector<float> make_boundaries(const std::vector<float> & centroids) {
++    std::vector<float> boundaries;
++    boundaries.reserve(centroids.size() > 1 ? centroids.size() - 1 : 0);
++    for (size_t i = 0; i + 1 < centroids.size(); ++i) {
++        boundaries.push_back(0.5f * (centroids[i] + centroids[i + 1]));
++    }
++    return boundaries;
++}
++
++static uint16_t quantize_coordinate(float value, const std::vector<float> & boundaries) {
++    return static_cast<uint16_t>(std::upper_bound(boundaries.begin(), boundaries.end(), value) - boundaries.begin());
++}
++
++static turboquant_metrics finalize_ip_metrics(
++        double mse_sum,
++        double mse_max,
++        size_t mse_count,
++        double bias_sum,
++        double abs_sum,
++        double sq_sum,
++        size_t ip_count) {
++    turboquant_metrics metrics;
++    if (mse_count > 0) {
++        metrics.mse_mean = mse_sum / double(mse_count);
++        metrics.mse_max = mse_max;
++    }
++    if (ip_count == 0) {
++        return metrics;
++    }
++    metrics.ip_bias_mean = bias_sum / double(ip_count);
++    metrics.ip_rmse = std::sqrt(sq_sum / double(ip_count));
++    metrics.ip_mae = abs_sum / double(ip_count);
++    return metrics;
++}
++
++static turboquant_init_params make_prod_params(const turboquant_init_params & params) {
++    turboquant_init_params out = params;
++    out.qjl_dim = out.qjl_dim > 0 ? out.qjl_dim : out.dim;
++    return out;
++}
++
++static turboquant_init_params make_prod_mse_params(const turboquant_init_params & params) {
++    turboquant_init_params out = make_prod_params(params);
++    out.bits = std::max(1, params.bits - 1);
++    out.qjl_dim = 0;
++    return out;
++}
++
++static std::vector<uint16_t> sanitize_forced_indices(
++        const std::vector<uint16_t> & forced_outlier_indices,
++        int dim,
++        int n_outliers) {
++    std::vector<uint16_t> indices;
++    indices.reserve(std::min<int>(n_outliers, forced_outlier_indices.size()));
++    std::vector<uint8_t> seen((size_t) dim, 0);
++    for (uint16_t idx : forced_outlier_indices) {
++        if ((int) idx >= dim || seen[(size_t) idx]) {
++            continue;
++        }
++        indices.push_back(idx);
++        seen[(size_t) idx] = 1;
++        if ((int) indices.size() >= n_outliers) {
++            break;
++        }
++    }
++    std::sort(indices.begin(), indices.end());
++    return indices;
++}
++
++} // namespace
++
++turboquant_mse::turboquant_mse(const turboquant_init_params & params) : params_(params) {
++    if (params_.dim <= 0) {
++        throw std::invalid_argument("TurboQuant dimension must be positive");
++    }
++    if (params_.bits <= 0) {
++        throw std::invalid_argument("TurboQuant bits must be positive");
++    }
++    rotation_ = build_rotation_matrix(params_.dim, params_.seed);
++    centroids_ = solve_lloyd_max_centroids(params_.dim, params_.bits, params_.codebook_iters, params_.codebook_grid);
++    boundaries_ = make_boundaries(centroids_);
++}
++
++int turboquant_mse::dim() const {
++    return params_.dim;
++}
++
++int turboquant_mse::bits() const {
++    return params_.bits;
++}
++
++std::vector<float> turboquant_mse::rotate_unit(const std::vector<float> & x) const {
++    return matvec_rows(rotation_, params_.dim, params_.dim, x);
++}
++
++std::vector<float> turboquant_mse::unrotate_unit(const std::vector<float> & y) const {
++    return matvec_cols(rotation_, params_.dim, params_.dim, y);
++}
++
++turboquant_mse_compressed turboquant_mse::quantize(const std::vector<float> & x) const {
++    if ((int) x.size() != params_.dim) {
++        throw std::invalid_argument("TurboQuant input dimension mismatch");
++    }
++    turboquant_mse_compressed out;
++    std::vector<float> x_unit = normalize_vector(x, out.vec_norm);
++    std::vector<float> rotated = rotate_unit(x_unit);
++
++    out.indices.resize(params_.dim);
++    for (int i = 0; i < params_.dim; ++i) {
++        out.indices[i] = quantize_coordinate(rotated[i], boundaries_);
++    }
++    return out;
++}
++
++std::vector<float> turboquant_mse::dequantize(const turboquant_mse_compressed & compressed) const {
++    if ((int) compressed.indices.size() != params_.dim) {
++        throw std::invalid_argument("TurboQuant compressed dimension mismatch");
++    }
++    std::vector<float> rotated(params_.dim, 0.0f);
++    for (int i = 0; i < params_.dim; ++i) {
++        rotated[i] = centroids_.at(compressed.indices[i]);
++    }
++    std::vector<float> x = unrotate_unit(rotated);
++    for (float & v : x) {
++        v *= compressed.vec_norm;
++    }
++    return x;
++}
++
++const std::vector<float> & turboquant_mse::centroids() const {
++    return centroids_;
++}
++
++const std::vector<float> & turboquant_mse::boundaries() const {
++    return boundaries_;
++}
++
++turboquant_prod::turboquant_prod(const turboquant_init_params & params)
++    : params_(make_prod_params(params)),
++      mse_(make_prod_mse_params(params)) {
++    qjl_matrix_ = build_gaussian_matrix(params_.qjl_dim, params_.dim, params_.seed + 1);
++}
++
++int turboquant_prod::dim() const {
++    return params_.dim;
++}
++
++int turboquant_prod::bits() const {
++    return params_.bits;
++}
++
++int turboquant_prod::qjl_dim() const {
++    return params_.qjl_dim;
++}
++
++int turboquant_prod::outlier_channels() const {
++    return std::max(0, params_.outlier_channels);
++}
++
++turboquant_prod_compressed turboquant_prod::quantize(const std::vector<float> & x) const {
++    return quantize(x, {});
++}
++
++turboquant_prod_compressed turboquant_prod::quantize(
++        const std::vector<float> & x,
++        const std::vector<uint16_t> & forced_outlier_indices) const {
++    turboquant_prod_compressed out;
++    out.mse = mse_.quantize(x);
++    const std::vector<float> x_mse = mse_.dequantize(out.mse);
++    std::vector<float> residual(params_.dim, 0.0f);
++    for (int i = 0; i < params_.dim; ++i) {
++        residual[i] = x[i] - x_mse[i];
++    }
++
++    const int n_outliers = std::min(params_.dim, std::max(0, params_.outlier_channels));
++    if (n_outliers > 0) {
++        std::vector<uint16_t> selected = sanitize_forced_indices(forced_outlier_indices, params_.dim, n_outliers);
++        if ((int) selected.size() < n_outliers) {
++            std::vector<std::pair<float, int>> ranked;
++            ranked.reserve(params_.dim);
++            for (int i = 0; i < params_.dim; ++i) {
++                ranked.emplace_back(std::fabs(residual[i]), i);
++            }
++            std::partial_sort(ranked.begin(), ranked.begin() + n_outliers, ranked.end(),
++                    [](const auto & a, const auto & b) {
++                        if (a.first != b.first) {
++                            return a.first > b.first;
++                        }
++                        return a.second < b.second;
++                    });
++            selected.resize((size_t) n_outliers);
++            for (int i = 0; i < n_outliers; ++i) {
++                selected[(size_t) i] = static_cast<uint16_t>(ranked[(size_t) i].second);
++            }
++            std::sort(selected.begin(), selected.end());
++        }
++        out.outlier_indices.resize(n_outliers);
++        out.outlier_values.resize(n_outliers);
++        for (int i = 0; i < n_outliers; ++i) {
++            const int idx = selected[(size_t) i];
++            out.outlier_indices[i] = static_cast<uint16_t>(idx);
++            out.outlier_values[i] = residual[idx];
++            residual[idx] = 0.0f;
++        }
++    }
++
++    out.residual_norm = l2_norm(residual);
++    std::vector<float> projected = matvec_rows(qjl_matrix_, params_.qjl_dim, params_.dim, residual);
++    out.qjl_signs.resize(params_.qjl_dim);
++    for (int i = 0; i < params_.qjl_dim; ++i) {
++        out.qjl_signs[i] = projected[i] >= 0.0f ? int8_t(1) : int8_t(-1);
++    }
++    return out;
++}
++
++std::vector<float> turboquant_prod::dequantize(const turboquant_prod_compressed & compressed) const {
++    return mse_.dequantize(compressed.mse);
++}
++
++double turboquant_prod::inner_product(const std::vector<float> & q, const turboquant_prod_compressed & compressed) const {
++    if ((int) q.size() != params_.dim) {
++        throw std::invalid_argument("TurboQuant query dimension mismatch");
++    }
++    const std::vector<float> x_mse = mse_.dequantize(compressed.mse);
++    const double term1 = double(dot_product(q, x_mse));
++    double outlier_term = 0.0;
++    const size_t n_outliers = std::min(compressed.outlier_indices.size(), compressed.outlier_values.size());
++    for (size_t i = 0; i < n_outliers; ++i) {
++        const uint16_t idx = compressed.outlier_indices[i];
++        if (idx < q.size()) {
++            outlier_term += double(q[idx]) * double(compressed.outlier_values[i]);
++        }
++    }
++    const std::vector<float> projected = matvec_rows(qjl_matrix_, params_.qjl_dim, params_.dim, q);
++    double qjl_ip = 0.0;
++    for (int i = 0; i < params_.qjl_dim; ++i) {
++        qjl_ip += double(projected[i]) * double(compressed.qjl_signs[i]);
++    }
++    const double correction_scale = std::sqrt(kPi / 2.0) / double(params_.qjl_dim);
++    const double term2 = double(compressed.residual_norm) * correction_scale * qjl_ip;
++    return term1 + outlier_term + term2;
++}
++
++const turboquant_mse & turboquant_prod::mse_quantizer() const {
++    return mse_;
++}
++
++const std::vector<float> & turboquant_prod::qjl_matrix() const {
++    return qjl_matrix_;
++}
++
++std::vector<float> turboquant_make_unit_vector(int dim, uint64_t seed, uint64_t sample_idx) {
++    std::mt19937_64 rng(seed + 0x9e3779b97f4a7c15ULL * (sample_idx + 1));
++    std::normal_distribution<float> normal(0.0f, 1.0f);
++    std::vector<float> x(dim);
++    for (float & v : x) {
++        v = normal(rng);
++    }
++    float norm = 1.0f;
++    return normalize_vector(x, norm);
++}
++
++turboquant_metrics turboquant_score_mse(
++        const turboquant_mse & quantizer,
++        const std::vector<std::vector<float>> & dataset) {
++    double mse_sum = 0.0;
++    double mse_max = 0.0;
++    for (const auto & x : dataset) {
++        const auto compressed = quantizer.quantize(x);
++        const auto x_hat = quantizer.dequantize(compressed);
++        double err = 0.0;
++        for (size_t i = 0; i < x.size(); ++i) {
++            const double d = double(x[i]) - double(x_hat[i]);
++            err += d * d;
++        }
++        err /= double(std::max<size_t>(1, x.size()));
++        mse_sum += err;
++        mse_max = std::max(mse_max, err);
++    }
++    turboquant_metrics metrics;
++    if (!dataset.empty()) {
++        metrics.mse_mean = mse_sum / double(dataset.size());
++        metrics.mse_max = mse_max;
++    }
++    return metrics;
++}
++
++turboquant_metrics turboquant_score_mse_inner_products(
++        const turboquant_mse & quantizer,
++        const std::vector<std::vector<float>> & dataset,
++        const std::vector<std::vector<float>> & queries) {
++    std::vector<std::vector<float>> reconstructed;
++    reconstructed.reserve(dataset.size());
++
++    double mse_sum = 0.0;
++    double mse_max = 0.0;
++    for (const auto & x : dataset) {
++        const auto compressed = quantizer.quantize(x);
++        reconstructed.push_back(quantizer.dequantize(compressed));
++        double err = 0.0;
++        for (size_t i = 0; i < x.size(); ++i) {
++            const double d = double(x[i]) - double(reconstructed.back()[i]);
++            err += d * d;
++        }
++        err /= double(std::max<size_t>(1, x.size()));
++        mse_sum += err;
++        mse_max = std::max(mse_max, err);
++    }
++
++    double bias_sum = 0.0;
++    double abs_sum = 0.0;
++    double sq_sum = 0.0;
++    size_t ip_count = 0;
++    for (const auto & q : queries) {
++        for (size_t i = 0; i < dataset.size(); ++i) {
++            const double truth = double(dot_product(q, dataset[i]));
++            const double estimate = double(dot_product(q, reconstructed[i]));
++            const double delta = estimate - truth;
++            bias_sum += delta;
++            abs_sum += std::abs(delta);
++            sq_sum += delta * delta;
++            ip_count++;
++        }
++    }
++
++    return finalize_ip_metrics(mse_sum, mse_max, dataset.size(), bias_sum, abs_sum, sq_sum, ip_count);
++}
++
++turboquant_metrics turboquant_score_prod(
++        const turboquant_prod & quantizer,
++        const std::vector<std::vector<float>> & dataset,
++        const std::vector<std::vector<float>> & queries) {
++    std::vector<turboquant_prod_compressed> compressed;
++    compressed.reserve(dataset.size());
++    for (const auto & x : dataset) {
++        compressed.push_back(quantizer.quantize(x));
++    }
++
++    double mse_sum = 0.0;
++    double mse_max = 0.0;
++    double bias_sum = 0.0;
++    double abs_sum = 0.0;
++    double sq_sum = 0.0;
++    size_t count = 0;
++
++    for (size_t i = 0; i < dataset.size(); ++i) {
++        const auto x_hat = quantizer.dequantize(compressed[i]);
++        double err = 0.0;
++        for (size_t j = 0; j < dataset[i].size(); ++j) {
++            const double d = double(dataset[i][j]) - double(x_hat[j]);
++            err += d * d;
++        }
++        err /= double(std::max<size_t>(1, dataset[i].size()));
++        mse_sum += err;
++        mse_max = std::max(mse_max, err);
++    }
++
++    for (const auto & q : queries) {
++        for (size_t i = 0; i < dataset.size(); ++i) {
++            const double truth = double(dot_product(q, dataset[i]));
++            const double estimate = quantizer.inner_product(q, compressed[i]);
++            const double delta = estimate - truth;
++            bias_sum += delta;
++            abs_sum += std::abs(delta);
++            sq_sum += delta * delta;
++            count++;
++        }
++    }
++
++    return finalize_ip_metrics(mse_sum, mse_max, dataset.size(), bias_sum, abs_sum, sq_sum, count);
++}
++
++std::string turboquant_metrics_json(const turboquant_metrics & metrics) {
++    std::ostringstream out;
++    out << std::fixed << std::setprecision(8)
++        << "{"
++        << "\"mse_mean\":" << metrics.mse_mean << ","
++        << "\"mse_max\":" << metrics.mse_max << ","
++        << "\"ip_bias_mean\":" << metrics.ip_bias_mean << ","
++        << "\"ip_rmse\":" << metrics.ip_rmse << ","
++        << "\"ip_mae\":" << metrics.ip_mae
++        << "}";
++    return out.str();
++}
++
++turboquant_recipe_config turboquant_recipe_for_name(const std::string & name, int dim) {
++    turboquant_recipe_config recipe;
++    recipe.bits = 4;
++    recipe.qjl_dim = std::max(dim, dim * 2);
++    recipe.outlier_channels = std::max(0, dim / 32);
++
++    std::string normalized = name;
++    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
++        return static_cast<char>(std::tolower(c));
++    });
++
++    if (normalized.empty() || normalized == "manual") {
++        recipe.name = "manual";
++        return recipe;
++    }
++    if (normalized == "turboquant25" || normalized == "tq25" || normalized == "25") {
++        recipe.name = "turboquant25";
++        recipe.bits = 3;
++        recipe.qjl_dim = std::max(dim, dim * 2);
++        recipe.outlier_channels = std::max(0, dim / 4);
++        return recipe;
++    }
++    if (normalized == "turboquant35" || normalized == "tq35" || normalized == "35") {
++        recipe.name = "turboquant35";
++        recipe.bits = 4;
++        recipe.qjl_dim = std::max(dim, dim * 4);
++        recipe.outlier_channels = std::max(0, dim / 2);
++        return recipe;
++    }
++    if (normalized == "best" || normalized == "lab_best" || normalized == "speed") {
++        recipe.name = "lab_best";
++        recipe.bits = 4;
++        recipe.qjl_dim = std::max(dim, dim * 4);
++        recipe.outlier_channels = std::max(4, dim / 32);
++        return recipe;
++    }
++    if (normalized == "lab_context" || normalized == "context" || normalized == "aggressive") {
++        recipe.name = "lab_context";
++        recipe.bits = 4;
++        recipe.qjl_dim = std::max(dim, dim * 2);
++        recipe.outlier_channels = std::max(2, dim / 64);
++        return recipe;
++    }
++    if (normalized == "lab_context_fast" || normalized == "context_fast" || normalized == "aggressive_fast") {
++        recipe.name = "lab_context_fast";
++        recipe.bits = 4;
++        recipe.qjl_dim = std::max(dim / 2, dim);
++        recipe.outlier_channels = std::max(1, dim / 128);
++        return recipe;
++    }
++    if (normalized == "lab_context_ultra" || normalized == "context_ultra" || normalized == "aggressive_ultra") {
++        recipe.name = "lab_context_ultra";
++        recipe.bits = 4;
++        recipe.qjl_dim = std::max(64, dim / 2);
++        recipe.outlier_channels = 1;
++        return recipe;
++    }
++    if (normalized == "memory_max" || normalized == "memmax" || normalized == "max_memory" || normalized == "memory-first") {
++        recipe.name = "memory_max";
++        recipe.bits = 3;
++        recipe.qjl_dim = std::max(64, dim / 2);
++        recipe.outlier_channels = 0;
++        return recipe;
++    }
++
++    recipe.name = normalized;
++    return recipe;
++}
++
++} // namespace llama_lab
+diff --git a/ggml/src/ggml-cuda/turboquant-exact.cuh b/ggml/src/ggml-cuda/turboquant-exact.cuh
+new file mode 100644
+index 0000000..8080b9e
+--- /dev/null
++++ b/ggml/src/ggml-cuda/turboquant-exact.cuh
+@@ -0,0 +1,32 @@
++#pragma once
++
++#include "common.cuh"
++#include "../../../common/turboquant.h"
++
++#include <string>
++#include <vector>
++
++namespace llama_lab {
++
++bool turboquant_score_prod_cuda_raw(
++        const std::vector<float> & queries_flat,
++        const std::vector<float> & dataset_flat,
++        const std::vector<float> & mse_flat,
++        const std::vector<int8_t> & qjl_signs_flat,
++        const std::vector<float> & residual_norms,
++        const std::vector<float> & qjl_matrix,
++        int nq,
++        int nk,
++        int dim,
++        int qjl_dim,
++        turboquant_metrics & metrics_out,
++        std::string & error_out);
++
++bool ggml_cuda_op_turboquant_exact_supported(const ggml_tensor * dst);
++void ggml_cuda_op_turboquant_exact(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++bool ggml_cuda_op_turboquant_pack_supported(const ggml_tensor * dst);
++void ggml_cuda_op_turboquant_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++bool ggml_cuda_op_turboquant_fattn_supported(const ggml_tensor * dst);
++void ggml_cuda_op_turboquant_fattn(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++
++} // namespace llama_lab
+diff --git a/ggml/src/ggml-cuda/turboquant-probe.cu b/ggml/src/ggml-cuda/turboquant-probe.cu
+new file mode 100644
+index 0000000..84e68a2
+--- /dev/null
++++ b/ggml/src/ggml-cuda/turboquant-probe.cu
+@@ -0,0 +1,1893 @@
++#include "turboquant-exact.cuh"
++#include "dequantize.cuh"
++
++#include <cuda_runtime.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdlib>
++#include <cstdint>
++#include <limits>
++#include <memory>
++#include <mutex>
++#include <random>
++#include <stdexcept>
++#include <string>
++#include <unordered_map>
++
++namespace llama_lab {
++
++namespace {
++
++constexpr double kPi = 3.14159265358979323846;
++constexpr const char * kTurboquantExactMarker = "llama_lab_turboquant_exact";
++constexpr const char * kTurboquantPackMarker = "llama_lab_turboquant_pack";
++
++__device__ inline float warp_reduce_sum(float value) {
++    for (int offset = 16; offset > 0; offset >>= 1) {
++        value += __shfl_down_sync(0xffffffff, value, offset);
++    }
++    return value;
++}
++
++__device__ inline float block_reduce_sum(float value) {
++    __shared__ float warp_sums[8];
++
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    const int nwarps = (blockDim.x + 31) >> 5;
++
++    value = warp_reduce_sum(value);
++    if (lane == 0) {
++        warp_sums[warp] = value;
++    }
++    __syncthreads();
++
++    float block_sum = 0.0f;
++    if (warp == 0) {
++        block_sum = lane < nwarps ? warp_sums[lane] : 0.0f;
++        block_sum = warp_reduce_sum(block_sum);
++        if (lane == 0) {
++            warp_sums[0] = block_sum;
++        }
++    }
++    __syncthreads();
++
++    return warp_sums[0];
++}
++
++__device__ __forceinline__ float turboquant_load_v_value(const char * v_base, ggml_type v_type, int dim_idx) {
++    if (v_type == GGML_TYPE_F16) {
++        const char * v_ptr = v_base + dim_idx * int64_t(sizeof(half));
++        return __half2float(*reinterpret_cast<const half *>(v_ptr));
++    }
++    if (v_type == GGML_TYPE_Q8_0) {
++        const block_q8_0 * v_blocks = reinterpret_cast<const block_q8_0 *>(v_base);
++        const int block_idx = dim_idx / QK8_0;
++        const int block_off = dim_idx % QK8_0;
++        return float(v_blocks[block_idx].qs[block_off]) * float(v_blocks[block_idx].d);
++    }
++    if (v_type == GGML_TYPE_Q4_0) {
++        float2 dq;
++        dequantize_q4_0(v_base, dim_idx / QK4_0, dim_idx % (QK4_0 / 2), dq);
++        return (dim_idx % QK4_0) < (QK4_0 / 2) ? dq.x : dq.y;
++    }
++    if (v_type == GGML_TYPE_Q4_1) {
++        float2 dq;
++        dequantize_q4_1(v_base, dim_idx / QK4_1, dim_idx % (QK4_1 / 2), dq);
++        return (dim_idx % QK4_1) < (QK4_1 / 2) ? dq.x : dq.y;
++    }
++    if (v_type == GGML_TYPE_Q5_0) {
++        float2 dq;
++        dequantize_q5_0(v_base, dim_idx / QK5_0, dim_idx % (QK5_0 / 2), dq);
++        return (dim_idx % QK5_0) < (QK5_0 / 2) ? dq.x : dq.y;
++    }
++    if (v_type == GGML_TYPE_Q5_1) {
++        float2 dq;
++        dequantize_q5_1(v_base, dim_idx / QK5_1, dim_idx % (QK5_1 / 2), dq);
++        return (dim_idx % QK5_1) < (QK5_1 / 2) ? dq.x : dq.y;
++    }
++    return 0.0f;
++}
++
++struct cuda_buffer {
++    void * ptr = nullptr;
++
++    void reset() {
++        if (ptr != nullptr) {
++            cudaFree(ptr);
++            ptr = nullptr;
++        }
++    }
++
++    ~cuda_buffer() {
++        reset();
++    }
++
++    cuda_buffer(const cuda_buffer &) = delete;
++    cuda_buffer & operator=(const cuda_buffer &) = delete;
++    cuda_buffer() = default;
++    cuda_buffer(cuda_buffer && other) noexcept : ptr(other.ptr) {
++        other.ptr = nullptr;
++    }
++    cuda_buffer & operator=(cuda_buffer && other) noexcept {
++        if (this != &other) {
++            reset();
++            ptr = other.ptr;
++            other.ptr = nullptr;
++        }
++        return *this;
++    }
++};
++
++static void cuda_check(cudaError_t status, const char * what) {
++    if (status != cudaSuccess) {
++        throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(status));
++    }
++}
++
++static int turboquant_env_int(const char * name, int fallback) {
++    const char * raw = std::getenv(name);
++    if (raw == nullptr || *raw == '\0') {
++        return fallback;
++    }
++    return std::atoi(raw);
++}
++
++static int align_up_int(int value, int alignment) {
++    return ((value + alignment - 1) / alignment) * alignment;
++}
++
++static int turboquant_index_bytes_for_bits(int dim, int bits) {
++    return (dim * bits + 7) / 8;
++}
++
++__device__ __forceinline__ uint8_t turboquant_load_code_device(const uint8_t * src, int idx, int bits) {
++    const int bit_offset = idx * bits;
++    const int byte_offset = bit_offset / 8;
++    const int shift = bit_offset % 8;
++    uint16_t word = src[byte_offset];
++    if (shift + bits > 8) {
++        word |= uint16_t(src[byte_offset + 1]) << 8;
++    }
++    return uint8_t((word >> shift) & ((1u << bits) - 1u));
++}
++
++struct turboquant_packed_layout {
++    int index_bytes = 0;
++    int vec_norm_offset = 0;
++    int residual_norm_offset = 0;
++    int sign_words_offset = 0;
++    int outlier_indices_offset = 0;
++    int outlier_values_offset = 0;
++    int packed_bytes = 0;
++    int mse_bits = 0;
++};
++
++static turboquant_packed_layout make_turboquant_packed_layout(int dim, int mse_bits, int qjl_dim, int outlier_channels) {
++    turboquant_packed_layout layout;
++    const int n_sign_words = (qjl_dim + 31) / 32;
++    layout.mse_bits = mse_bits;
++    layout.index_bytes = turboquant_index_bytes_for_bits(dim, mse_bits);
++    layout.vec_norm_offset = align_up_int(layout.index_bytes, 4);
++    layout.residual_norm_offset = layout.vec_norm_offset + int(sizeof(float));
++    layout.sign_words_offset = align_up_int(layout.residual_norm_offset + int(sizeof(float)), 4);
++    layout.outlier_indices_offset = layout.sign_words_offset + n_sign_words * int(sizeof(uint32_t));
++    layout.outlier_values_offset = align_up_int(layout.outlier_indices_offset + outlier_channels * int(sizeof(uint16_t)), 4);
++    layout.packed_bytes = layout.outlier_values_offset + outlier_channels * int(sizeof(float));
++    return layout;
++}
++
++static std::vector<float> build_rotation_matrix(int dim, uint64_t seed) {
++    std::mt19937_64 rng(seed);
++    std::normal_distribution<float> normal(0.0f, 1.0f);
++
++    std::vector<float> q(dim * dim, 0.0f);
++    for (int r = 0; r < dim; ++r) {
++        for (int c = 0; c < dim; ++c) {
++            q[r * dim + c] = normal(rng);
++        }
++    }
++
++    for (int i = 0; i < dim; ++i) {
++        for (int j = 0; j < i; ++j) {
++            float proj = 0.0f;
++            for (int c = 0; c < dim; ++c) {
++                proj += q[i * dim + c] * q[j * dim + c];
++            }
++            for (int c = 0; c < dim; ++c) {
++                q[i * dim + c] -= proj * q[j * dim + c];
++            }
++        }
++        float nrm = 0.0f;
++        for (int c = 0; c < dim; ++c) {
++            nrm += q[i * dim + c] * q[i * dim + c];
++        }
++        nrm = std::sqrt(std::max(nrm, 1e-12f));
++        for (int c = 0; c < dim; ++c) {
++            q[i * dim + c] /= nrm;
++        }
++    }
++
++    return q;
++}
++
++static std::vector<float> build_gaussian_matrix(int rows, int cols, uint64_t seed) {
++    std::mt19937_64 rng(seed);
++    std::normal_distribution<float> normal(0.0f, 1.0f);
++    std::vector<float> m(rows * cols);
++    for (float & v : m) {
++        v = normal(rng);
++    }
++    return m;
++}
++
++static std::vector<float> solve_lloyd_max_centroids(int dim, int bits, int iterations, int grid_size) {
++    const int n_levels = 1 << bits;
++    const double sigma = 1.0 / std::sqrt(std::max(dim, 1));
++    const double lo = -6.0 * sigma;
++    const double hi = 6.0 * sigma;
++    const double step = (hi - lo) / std::max(grid_size - 1, 1);
++
++    std::vector<double> xs(grid_size);
++    std::vector<double> pdf(grid_size);
++    const double coeff = 1.0 / (std::sqrt(2.0 * kPi) * sigma);
++    for (int i = 0; i < grid_size; ++i) {
++        const double x = lo + step * i;
++        xs[i] = x;
++        pdf[i] = coeff * std::exp(-(x * x) / (2.0 * sigma * sigma));
++    }
++
++    std::vector<double> centroids(n_levels);
++    for (int i = 0; i < n_levels; ++i) {
++        centroids[i] = lo + (hi - lo) * (double(i) + 0.5) / double(n_levels);
++    }
++
++    std::vector<double> boundaries(std::max(0, n_levels - 1));
++    for (int iter = 0; iter < iterations; ++iter) {
++        for (int i = 0; i + 1 < n_levels; ++i) {
++            boundaries[i] = 0.5 * (centroids[i] + centroids[i + 1]);
++        }
++
++        std::vector<double> next = centroids;
++        for (int level = 0; level < n_levels; ++level) {
++            const double a = (level == 0) ? lo : boundaries[level - 1];
++            const double b = (level + 1 == n_levels) ? hi : boundaries[level];
++            double num = 0.0;
++            double den = 0.0;
++            for (int i = 0; i < grid_size; ++i) {
++                const double x = xs[i];
++                if (x < a || x > b) {
++                    continue;
++                }
++                const double w = pdf[i];
++                num += x * w;
++                den += w;
++            }
++            if (den > 1e-12) {
++                next[level] = num / den;
++            }
++        }
++
++        double max_delta = 0.0;
++        for (int i = 0; i < n_levels; ++i) {
++            max_delta = std::max(max_delta, std::abs(next[i] - centroids[i]));
++        }
++        centroids.swap(next);
++        if (max_delta < 1e-10) {
++            break;
++        }
++    }
++
++    std::vector<float> out(n_levels);
++    for (int i = 0; i < n_levels; ++i) {
++        out[i] = static_cast<float>(centroids[i]);
++    }
++    return out;
++}
++
++static std::vector<float> make_boundaries(const std::vector<float> & centroids) {
++    std::vector<float> boundaries;
++    boundaries.reserve(centroids.size() > 1 ? centroids.size() - 1 : 0);
++    for (size_t i = 0; i + 1 < centroids.size(); ++i) {
++        boundaries.push_back(0.5f * (centroids[i] + centroids[i + 1]));
++    }
++    return boundaries;
++}
++
++struct turboquant_exact_device_params {
++    int dim = 0;
++    int bits = 0;
++    int mse_bits = 0;
++    int qjl_dim = 0;
++    int outlier_channels = 0;
++    int n_levels = 0;
++    turboquant_packed_layout layout;
++    float correction_scale = 0.0f;
++    std::vector<float> rotation;
++    std::vector<float> boundaries;
++    std::vector<float> centroids;
++    std::vector<float> qjl_matrix;
++    cuda_buffer d_rotation;
++    cuda_buffer d_boundaries;
++    cuda_buffer d_centroids;
++    cuda_buffer d_qjl_matrix;
++};
++
++struct turboquant_exact_cache_key {
++    const void * data = nullptr;
++    int dim = 0;
++    int bits = 0;
++    int qjl_dim = 0;
++    int outlier_channels = 0;
++    int n_head_k = 0;
++    int n_stream = 0;
++
++    bool operator==(const turboquant_exact_cache_key & other) const {
++        return data == other.data &&
++               dim == other.dim &&
++               bits == other.bits &&
++               qjl_dim == other.qjl_dim &&
++               outlier_channels == other.outlier_channels &&
++               n_head_k == other.n_head_k &&
++               n_stream == other.n_stream;
++    }
++};
++
++struct turboquant_exact_cache_key_hash {
++    size_t operator()(const turboquant_exact_cache_key & key) const noexcept {
++        size_t h = std::hash<const void *>{}(key.data);
++        h ^= std::hash<int>{}(key.dim) + 0x9e3779b9 + (h << 6) + (h >> 2);
++        h ^= std::hash<int>{}(key.bits) + 0x9e3779b9 + (h << 6) + (h >> 2);
++        h ^= std::hash<int>{}(key.qjl_dim) + 0x9e3779b9 + (h << 6) + (h >> 2);
++        h ^= std::hash<int>{}(key.outlier_channels) + 0x9e3779b9 + (h << 6) + (h >> 2);
++        h ^= std::hash<int>{}(key.n_head_k) + 0x9e3779b9 + (h << 6) + (h >> 2);
++        h ^= std::hash<int>{}(key.n_stream) + 0x9e3779b9 + (h << 6) + (h >> 2);
++        return h;
++    }
++};
++
++struct turboquant_exact_key_cache_entry {
++    int capacity_rows = 0;
++    int compressed_rows = 0;
++    int last_rows_seen = -1;
++    int packed_row_bytes = 0;
++    cuda_buffer d_packed;
++};
++
++static std::shared_ptr<turboquant_exact_device_params> get_turboquant_exact_device_params(int dim, int bits, int qjl_dim, int outlier_channels) {
++    static std::mutex mutex;
++    static std::unordered_map<std::string, std::shared_ptr<turboquant_exact_device_params>> cache;
++
++    const std::string key = std::to_string(dim) + ":" + std::to_string(bits) + ":" + std::to_string(qjl_dim) + ":" + std::to_string(outlier_channels);
++    std::lock_guard<std::mutex> lock(mutex);
++    auto it = cache.find(key);
++    if (it != cache.end()) {
++        return it->second;
++    }
++
++    auto params = std::make_shared<turboquant_exact_device_params>();
++    params->dim = dim;
++    params->bits = bits;
++    params->mse_bits = std::max(1, bits - 1);
++    params->qjl_dim = qjl_dim;
++    params->outlier_channels = std::max(0, outlier_channels);
++    params->n_levels = 1 << params->mse_bits;
++    params->layout = make_turboquant_packed_layout(dim, params->mse_bits, qjl_dim, params->outlier_channels);
++    params->correction_scale = std::sqrt(float(kPi / 2.0)) / float(qjl_dim);
++    params->rotation = build_rotation_matrix(dim, 42);
++    params->centroids = solve_lloyd_max_centroids(dim, params->mse_bits, 96, 4096);
++    params->boundaries = make_boundaries(params->centroids);
++    params->qjl_matrix = build_gaussian_matrix(qjl_dim, dim, 43);
++
++    cuda_check(cudaMalloc(&params->d_rotation.ptr, params->rotation.size() * sizeof(float)), "cudaMalloc turboquant rotation");
++    cuda_check(cudaMalloc(&params->d_boundaries.ptr, params->boundaries.size() * sizeof(float)), "cudaMalloc turboquant boundaries");
++    cuda_check(cudaMalloc(&params->d_centroids.ptr, params->centroids.size() * sizeof(float)), "cudaMalloc turboquant centroids");
++    cuda_check(cudaMalloc(&params->d_qjl_matrix.ptr, params->qjl_matrix.size() * sizeof(float)), "cudaMalloc turboquant qjl");
++
++    cuda_check(cudaMemcpy(params->d_rotation.ptr, params->rotation.data(), params->rotation.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy turboquant rotation");
++    cuda_check(cudaMemcpy(params->d_boundaries.ptr, params->boundaries.data(), params->boundaries.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy turboquant boundaries");
++    cuda_check(cudaMemcpy(params->d_centroids.ptr, params->centroids.data(), params->centroids.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy turboquant centroids");
++    cuda_check(cudaMemcpy(params->d_qjl_matrix.ptr, params->qjl_matrix.data(), params->qjl_matrix.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy turboquant qjl");
++
++    cache.emplace(key, params);
++    return params;
++}
++
++static std::shared_ptr<turboquant_exact_key_cache_entry> get_turboquant_exact_key_cache(
++        const turboquant_exact_cache_key & key,
++        int required_rows,
++        int packed_row_bytes) {
++    static std::mutex mutex;
++    static std::unordered_map<turboquant_exact_cache_key, std::shared_ptr<turboquant_exact_key_cache_entry>, turboquant_exact_cache_key_hash> cache;
++
++    std::lock_guard<std::mutex> lock(mutex);
++    auto it = cache.find(key);
++    if (it == cache.end()) {
++        auto entry = std::make_shared<turboquant_exact_key_cache_entry>();
++        cache.emplace(key, entry);
++        it = cache.find(key);
++    }
++
++    auto entry = it->second;
++    if (entry->capacity_rows >= required_rows) {
++        return entry;
++    }
++
++    const int new_capacity = std::max(required_rows, std::max(256, entry->capacity_rows * 2));
++    entry->d_packed.reset();
++    entry->packed_row_bytes = packed_row_bytes;
++    cuda_check(cudaMalloc(&entry->d_packed.ptr, size_t(new_capacity) * packed_row_bytes), "cudaMalloc turboquant cache packed rows");
++    entry->capacity_rows = new_capacity;
++    entry->compressed_rows = 0;
++    entry->last_rows_seen = -1;
++    return entry;
++}
++
++__global__ void turboquant_project_queries_kernel(
++        const float * __restrict__ queries,
++        const float * __restrict__ qjl_matrix,
++        float * __restrict__ projected,
++        int nq,
++        int qjl_dim,
++        int dim) {
++    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    const int total = nq * qjl_dim;
++    if (idx >= total) {
++        return;
++    }
++
++    const int q_idx = idx / qjl_dim;
++    const int row = idx - q_idx * qjl_dim;
++
++    const float * q = queries + q_idx * dim;
++    const float * a = qjl_matrix + row * dim;
++
++    float acc = 0.0f;
++    for (int i = 0; i < dim; ++i) {
++        acc += q[i] * a[i];
++    }
++    projected[idx] = acc;
++}
++
++__global__ void turboquant_score_kernel(
++        const float * __restrict__ queries,
++        const float * __restrict__ dataset,
++        const float * __restrict__ projected_queries,
++        const float * __restrict__ mse_vecs,
++        const int8_t * __restrict__ qjl_signs,
++        const float * __restrict__ residual_norms,
++        float * __restrict__ out_truth,
++        float * __restrict__ out_scores,
++        int nq,
++        int nk,
++        int dim,
++        int qjl_dim,
++        float correction_scale) {
++    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    const int total = nq * nk;
++    if (idx >= total) {
++        return;
++    }
++
++    const int q_idx = idx / nk;
++    const int k_idx = idx - q_idx * nk;
++
++    const float * q = queries + q_idx * dim;
++    const float * x = dataset + k_idx * dim;
++    const float * mse = mse_vecs + k_idx * dim;
++    const float * proj_q = projected_queries + q_idx * qjl_dim;
++    const int8_t * signs = qjl_signs + k_idx * qjl_dim;
++
++    float truth = 0.0f;
++    float term1 = 0.0f;
++    for (int i = 0; i < dim; ++i) {
++        const float qv = q[i];
++        truth += qv * x[i];
++        term1 += qv * mse[i];
++    }
++
++    float qjl_ip = 0.0f;
++    for (int i = 0; i < qjl_dim; ++i) {
++        qjl_ip += proj_q[i] * float(signs[i]);
++    }
++
++    out_truth[idx] = truth;
++    out_scores[idx] = term1 + residual_norms[k_idx] * correction_scale * qjl_ip;
++}
++
++__global__ void turboquant_compress_keys_kernel(
++        const float * __restrict__ keys,
++        float * __restrict__ mse_out,
++        int8_t * __restrict__ signs_out,
++        float * __restrict__ residual_norm_out,
++        const float * __restrict__ rotation,
++        const float * __restrict__ boundaries,
++        const float * __restrict__ centroids,
++        const float * __restrict__ qjl_matrix,
++        int dim,
++        int qjl_dim,
++        int nkv,
++        int row_offset,
++        int n_levels) {
++    const int local_row = blockIdx.x;
++    const int row = row_offset + local_row;
++    const int tid = threadIdx.x;
++    if (row >= nkv) {
++        return;
++    }
++
++    extern __shared__ float shmem[];
++    float * x = shmem;
++    float * rotated = x + dim;
++    float * x_mse = rotated + dim;
++    float * residual = x_mse + dim;
++    float * reduce = residual + dim;
++
++    const float * key = keys + size_t(row) * dim;
++    if (tid < dim) {
++        x[tid] = key[tid];
++    }
++    __syncthreads();
++
++    float part = 0.0f;
++    for (int i = tid; i < dim; i += blockDim.x) {
++        part += x[i] * x[i];
++    }
++    reduce[tid] = part;
++    __syncthreads();
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            reduce[tid] += reduce[tid + stride];
++        }
++        __syncthreads();
++    }
++    const float norm = reduce[0] > 0.0f ? sqrtf(reduce[0]) : 1.0f;
++
++    for (int r = tid; r < dim; r += blockDim.x) {
++        float acc = 0.0f;
++        const float * rot_row = rotation + r * dim;
++        for (int c = 0; c < dim; ++c) {
++            acc += rot_row[c] * (x[c] / norm);
++        }
++        int idx = 0;
++        while (idx < n_levels - 1 && acc > boundaries[idx]) {
++            ++idx;
++        }
++        rotated[r] = centroids[idx];
++    }
++    __syncthreads();
++
++    for (int c = tid; c < dim; c += blockDim.x) {
++        float acc = 0.0f;
++        for (int r = 0; r < dim; ++r) {
++            acc += rotation[r * dim + c] * rotated[r];
++        }
++        const float val = acc * norm;
++        x_mse[c] = val;
++        residual[c] = x[c] - val;
++        mse_out[row * dim + c] = val;
++    }
++    __syncthreads();
++
++    part = 0.0f;
++    for (int i = tid; i < dim; i += blockDim.x) {
++        part += residual[i] * residual[i];
++    }
++    reduce[tid] = part;
++    __syncthreads();
++    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            reduce[tid] += reduce[tid + stride];
++        }
++        __syncthreads();
++    }
++    const float residual_norm = sqrtf(fmaxf(reduce[0], 0.0f));
++    if (tid == 0) {
++        residual_norm_out[row] = residual_norm;
++    }
++
++    for (int j = tid; j < qjl_dim; j += blockDim.x) {
++        float acc = 0.0f;
++        const float * a = qjl_matrix + j * dim;
++        for (int c = 0; c < dim; ++c) {
++            acc += a[c] * residual[c];
++        }
++        signs_out[row * qjl_dim + j] = acc >= 0.0f ? int8_t(1) : int8_t(-1);
++    }
++}
++
++__global__ void turboquant_project_qrows_kernel(
++        const float * __restrict__ queries,
++        float * __restrict__ projected,
++        const float * __restrict__ qjl_matrix,
++        int dim,
++        int qjl_dim,
++        int n_q,
++        int n_head_q,
++        int n_stream,
++        int64_t q_nb1,
++        int64_t q_nb2,
++        int64_t q_nb3) {
++    const int total = n_q * n_head_q * n_stream * qjl_dim;
++    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
++    if (idx >= total) {
++        return;
++    }
++
++    const int qjl_row = idx % qjl_dim;
++    const int qrow = idx / qjl_dim;
++    const int q_tok = qrow % n_q;
++    const int q_head_stream = qrow / n_q;
++    const int q_head = q_head_stream % n_head_q;
++    const int stream = q_head_stream / n_head_q;
++
++    const char * q_ptr = reinterpret_cast<const char *>(queries)
++            + q_tok * q_nb1
++            + q_head * q_nb2
++            + stream * q_nb3;
++    const float * q = reinterpret_cast<const float *>(q_ptr);
++    const float * a = qjl_matrix + qjl_row * dim;
++
++    float acc = 0.0f;
++    for (int i = 0; i < dim; ++i) {
++        acc += q[i] * a[i];
++    }
++    projected[idx] = acc;
++}
++
++__global__ void turboquant_kq_kernel(
++        const float * __restrict__ queries,
++        const float * __restrict__ mse_keys,
++        const int8_t * __restrict__ qjl_signs,
++        const float * __restrict__ residual_norms,
++        const float * __restrict__ projected_queries,
++        float * __restrict__ dst,
++        int dim,
++        int qjl_dim,
++        int n_q,
++        int n_k,
++        int n_head_q,
++        int n_head_k,
++        int n_stream,
++        int64_t q_nb1,
++        int64_t q_nb2,
++        int64_t q_nb3,
++        int64_t dst_nb1,
++        int64_t dst_nb2,
++        int64_t dst_nb3,
++        float correction_scale) {
++    const int qrow = blockIdx.x;
++    const int kv_tok = blockIdx.y * blockDim.x + threadIdx.x;
++    if (qrow >= n_q * n_head_q * n_stream || kv_tok >= n_k) {
++        return;
++    }
++
++    const int q_tok = qrow % n_q;
++    const int q_head_stream = qrow / n_q;
++    const int q_head = q_head_stream % n_head_q;
++    const int stream = q_head_stream / n_head_q;
++    const int kv_head = (q_head * n_head_k) / n_head_q;
++
++    const char * q_ptr = reinterpret_cast<const char *>(queries)
++            + q_tok * q_nb1
++            + q_head * q_nb2
++            + stream * q_nb3;
++    const float * q = reinterpret_cast<const float *>(q_ptr);
++
++    const int key_row = stream * (n_head_k * n_k) + kv_head * n_k + kv_tok;
++    const float * mse = mse_keys + key_row * dim;
++    const int8_t * signs = qjl_signs + key_row * qjl_dim;
++    const float * proj_q = projected_queries + qrow * qjl_dim;
++
++    float term1 = 0.0f;
++    for (int i = 0; i < dim; ++i) {
++        term1 += q[i] * mse[i];
++    }
++
++    float qjl_ip = 0.0f;
++    for (int i = 0; i < qjl_dim; ++i) {
++        qjl_ip += proj_q[i] * float(signs[i]);
++    }
++
++    const float score = term1 + residual_norms[key_row] * correction_scale * qjl_ip;
++    char * out_ptr = reinterpret_cast<char *>(dst)
++            + kv_tok * sizeof(float)
++            + q_tok * dst_nb1
++            + q_head * dst_nb2
++            + stream * dst_nb3;
++    *reinterpret_cast<float *>(out_ptr) = score;
++}
++
++__global__ void turboquant_rotate_project_qrows_kernel(
++        const float * __restrict__ queries,
++        float * __restrict__ rotated_queries,
++        float * __restrict__ projected_queries,
++        const float * __restrict__ rotation,
++        const float * __restrict__ qjl_matrix,
++        int dim,
++        int qjl_dim,
++        int n_q,
++        int n_head_q,
++        int n_stream,
++        int64_t q_nb1,
++        int64_t q_nb2,
++        int64_t q_nb3) {
++    const int qrow = blockIdx.x;
++    const int tid = threadIdx.x;
++    const int qrow_total = n_q * n_head_q * n_stream;
++    if (qrow >= qrow_total) {
++        return;
++    }
++
++    const int q_tok = qrow % n_q;
++    const int q_head_stream = qrow / n_q;
++    const int q_head = q_head_stream % n_head_q;
++    const int stream = q_head_stream / n_head_q;
++
++    const char * q_ptr = reinterpret_cast<const char *>(queries)
++            + q_tok * q_nb1
++            + q_head * q_nb2
++            + stream * q_nb3;
++    const float * q = reinterpret_cast<const float *>(q_ptr);
++    extern __shared__ float sh_q[];
++    for (int i = tid; i < dim; i += blockDim.x) {
++        sh_q[i] = q[i];
++    }
++    __syncthreads();
++
++    for (int r = tid; r < dim; r += blockDim.x) {
++        float acc = 0.0f;
++        const float * rot_row = rotation + r * dim;
++        for (int c = 0; c < dim; ++c) {
++            acc += rot_row[c] * sh_q[c];
++        }
++        rotated_queries[qrow * dim + r] = acc;
++    }
++
++    for (int j = tid; j < qjl_dim; j += blockDim.x) {
++        float acc = 0.0f;
++        const float * a = qjl_matrix + j * dim;
++        for (int c = 0; c < dim; ++c) {
++            acc += a[c] * sh_q[c];
++        }
++        projected_queries[qrow * qjl_dim + j] = acc;
++    }
++}
++
++__global__ void turboquant_compress_keys_compact_kernel(
++        const float * __restrict__ keys,
++        int8_t * __restrict__ packed_out,
++        const float * __restrict__ rotation,
++        const float * __restrict__ boundaries,
++        const float * __restrict__ centroids,
++        const float * __restrict__ qjl_matrix,
++        int dim,
++        int mse_bits,
++        int qjl_dim,
++        int outlier_channels,
++        int n_sign_words,
++        int packed_row_bytes,
++        int vec_norm_offset,
++        int residual_norm_offset,
++        int sign_words_offset,
++        int outlier_indices_offset,
++        int outlier_values_offset,
++        int nkv,
++        int row_offset,
++        int n_levels,
++        int n_k,
++        int n_head_k,
++        int n_stream,
++        int64_t k_nb1,
++        int64_t k_nb2,
++        int64_t k_nb3,
++        int64_t packed_nb1,
++        int64_t packed_nb2,
++        int64_t packed_nb3) {
++    const int local_row = blockIdx.x;
++    const int row = row_offset + local_row;
++    const int tid = threadIdx.x;
++    if (row >= nkv) {
++        return;
++    }
++
++    const int kv_tok = row % n_k;
++    const int kv_head_stream = row / n_k;
++    const int kv_head = kv_head_stream % n_head_k;
++    const int stream = kv_head_stream / n_head_k;
++
++    const char * key_ptr = reinterpret_cast<const char *>(keys)
++            + kv_tok * k_nb1
++            + kv_head * k_nb2
++            + stream * k_nb3;
++    const float * key = reinterpret_cast<const float *>(key_ptr);
++    int8_t * packed_row = packed_out
++            + kv_tok * packed_nb1
++            + kv_head * packed_nb2
++            + stream * packed_nb3;
++    uint8_t * code_bytes = reinterpret_cast<uint8_t *>(packed_row);
++    float * vec_norm_out = reinterpret_cast<float *>(packed_row + vec_norm_offset);
++    float * residual_norm_out = reinterpret_cast<float *>(packed_row + residual_norm_offset);
++    uint32_t * sign_words_out = reinterpret_cast<uint32_t *>(packed_row + sign_words_offset);
++    uint16_t * outlier_idx_out = outlier_channels > 0 ? reinterpret_cast<uint16_t *>(packed_row + outlier_indices_offset) : nullptr;
++    float * outlier_val_out = outlier_channels > 0 ? reinterpret_cast<float *>(packed_row + outlier_values_offset) : nullptr;
++
++    extern __shared__ float shmem_compact[];
++    float * key_sh = shmem_compact;
++    float * rotated = key_sh + dim;
++    float * residual = rotated + dim;
++    uint16_t * compact_codes = reinterpret_cast<uint16_t *>(residual + dim);
++
++    for (int i = tid; i < dim; i += blockDim.x) {
++        key_sh[i] = key[i];
++    }
++    __syncthreads();
++
++    float norm_sq = 0.0f;
++    for (int i = tid; i < dim; i += blockDim.x) {
++        norm_sq += key_sh[i] * key_sh[i];
++    }
++    norm_sq = block_reduce_sum(norm_sq);
++    const float norm = norm_sq > 0.0f ? sqrtf(norm_sq) : 1.0f;
++    const float inv_norm = 1.0f / norm;
++    if (tid == 0) {
++        *vec_norm_out = norm;
++    }
++
++    for (int r = tid; r < dim; r += blockDim.x) {
++        float acc = 0.0f;
++        const float * rot_row = rotation + r * dim;
++        for (int c = 0; c < dim; ++c) {
++            acc += rot_row[c] * (key_sh[c] * inv_norm);
++        }
++        int idx = 0;
++        while (idx < n_levels - 1 && acc > boundaries[idx]) {
++            ++idx;
++        }
++        compact_codes[r] = static_cast<uint16_t>(idx);
++        rotated[r] = centroids[idx];
++    }
++    __syncthreads();
++
++    for (int byte_idx = tid; byte_idx < vec_norm_offset; byte_idx += blockDim.x) {
++        uint32_t packed = 0;
++        const int first_idx = (byte_idx * 8) / mse_bits;
++        const int last_idx = min(dim - 1, (((byte_idx + 1) * 8) - 1) / mse_bits);
++        for (int idx = first_idx; idx <= last_idx; ++idx) {
++            const int local_bit = idx * mse_bits - byte_idx * 8;
++            const uint32_t code = compact_codes[idx] & ((1u << mse_bits) - 1u);
++            if (local_bit >= 0) {
++                packed |= code << local_bit;
++            } else {
++                packed |= code >> (-local_bit);
++            }
++        }
++        code_bytes[byte_idx] = uint8_t(packed & 0xFFu);
++    }
++    __syncthreads();
++
++    for (int c = tid; c < dim; c += blockDim.x) {
++        float acc = 0.0f;
++        for (int r = 0; r < dim; ++r) {
++            acc += rotation[r * dim + c] * rotated[r];
++        }
++        residual[c] = key_sh[c] - acc * norm;
++    }
++    __syncthreads();
++
++    if (outlier_channels > 0 && tid == 0) {
++        for (int oi = 0; oi < outlier_channels; ++oi) {
++            int best_idx = 0;
++            float best_abs = -1.0f;
++            for (int c = 0; c < dim; ++c) {
++                const float absv = fabsf(residual[c]);
++                if (absv > best_abs) {
++                    best_abs = absv;
++                    best_idx = c;
++                }
++            }
++            outlier_idx_out[oi] = static_cast<uint16_t>(best_idx);
++            outlier_val_out[oi] = residual[best_idx];
++            residual[best_idx] = 0.0f;
++        }
++    }
++    __syncthreads();
++
++    float residual_sq = 0.0f;
++    for (int c = tid; c < dim; c += blockDim.x) {
++        residual_sq += residual[c] * residual[c];
++    }
++    residual_sq = block_reduce_sum(residual_sq);
++    if (tid == 0) {
++        *residual_norm_out = sqrtf(fmaxf(residual_sq, 0.0f));
++    }
++
++    for (int w = tid; w < n_sign_words; w += blockDim.x) {
++        uint32_t bits = 0;
++        for (int b = 0; b < 32; ++b) {
++            const int j = w * 32 + b;
++            if (j >= qjl_dim) {
++                break;
++            }
++            float acc = 0.0f;
++            const float * a = qjl_matrix + j * dim;
++            for (int c = 0; c < dim; ++c) {
++                acc += a[c] * residual[c];
++            }
++            if (acc >= 0.0f) {
++                bits |= (1u << b);
++            }
++        }
++        sign_words_out[w] = bits;
++    }
++}
++
++__global__ void turboquant_kq_compact_kernel(
++        const float * __restrict__ queries,
++        const float * __restrict__ rotated_queries,
++        const float * __restrict__ projected_queries,
++        const int8_t * __restrict__ packed_keys,
++        const float * __restrict__ centroids,
++        float * __restrict__ dst,
++        int dim,
++        int mse_bits,
++        int qjl_dim,
++        int outlier_channels,
++        int n_sign_words,
++        int packed_row_bytes,
++        int vec_norm_offset,
++        int residual_norm_offset,
++        int sign_words_offset,
++        int outlier_indices_offset,
++        int outlier_values_offset,
++        int n_q,
++        int n_k,
++        int n_head_q,
++        int n_head_k,
++        int n_stream,
++        int64_t q_nb1,
++        int64_t q_nb2,
++        int64_t q_nb3,
++        int64_t k_nb1,
++        int64_t k_nb2,
++        int64_t k_nb3,
++        int64_t dst_nb1,
++        int64_t dst_nb2,
++        int64_t dst_nb3,
++        float correction_scale) {
++    const int qrow = blockIdx.x;
++    const int lane = threadIdx.x & 31;
++    const int warp = threadIdx.x >> 5;
++    const int warps_per_block = blockDim.x >> 5;
++    const int kv_tok = blockIdx.y * warps_per_block + warp;
++    if (qrow >= n_q * n_head_q * n_stream || kv_tok >= n_k) {
++        return;
++    }
++
++    const int q_tok = qrow % n_q;
++    const int q_head_stream = qrow / n_q;
++    const int q_head = q_head_stream % n_head_q;
++    const int stream = q_head_stream / n_head_q;
++    const int kv_head = (q_head * n_head_k) / n_head_q;
++    const int key_row = stream * (n_head_k * n_k) + kv_head * n_k + kv_tok;
++
++    const char * q_ptr = reinterpret_cast<const char *>(queries)
++            + q_tok * q_nb1
++            + q_head * q_nb2
++            + stream * q_nb3;
++    const float * q = reinterpret_cast<const float *>(q_ptr);
++    const float * rot_q = rotated_queries + qrow * dim;
++    const float * proj_q = projected_queries + qrow * qjl_dim;
++    float proj_q_total = 0.0f;
++    for (int j = lane; j < qjl_dim; j += 32) {
++        proj_q_total += proj_q[j];
++    }
++    proj_q_total = warp_reduce_sum(proj_q_total);
++
++    const int8_t * packed_row = packed_keys
++            + kv_tok * k_nb1
++            + kv_head * k_nb2
++            + stream * k_nb3;
++    const uint8_t * idxs = reinterpret_cast<const uint8_t *>(packed_row);
++    const float vec_norm = *reinterpret_cast<const float *>(packed_row + vec_norm_offset);
++    const float residual_norm = *reinterpret_cast<const float *>(packed_row + residual_norm_offset);
++    const uint32_t * words = reinterpret_cast<const uint32_t *>(packed_row + sign_words_offset);
++    const uint16_t * outlier_indices = outlier_channels > 0 ? reinterpret_cast<const uint16_t *>(packed_row + outlier_indices_offset) : nullptr;
++    const float * outlier_values = outlier_channels > 0 ? reinterpret_cast<const float *>(packed_row + outlier_values_offset) : nullptr;
++
++    float term1 = 0.0f;
++    for (int i = lane; i < dim; i += 32) {
++        term1 += rot_q[i] * centroids[turboquant_load_code_device(idxs, i, mse_bits)];
++    }
++    term1 = warp_reduce_sum(term1) * vec_norm;
++
++    float outlier_term = 0.0f;
++    for (int oi = lane; oi < outlier_channels; oi += 32) {
++        const uint16_t idx = outlier_indices[oi];
++        outlier_term += q[idx] * outlier_values[oi];
++    }
++    outlier_term = warp_reduce_sum(outlier_term);
++
++    float qjl_ip = -proj_q_total;
++    for (int w = lane; w < n_sign_words; w += 32) {
++        const uint32_t bits = words[w];
++        const int base = w * 32;
++        for (int b = 0; b < 32; ++b) {
++            const int j = base + b;
++            if (j >= qjl_dim) {
++                break;
++            }
++            if (bits & (1u << b)) {
++                qjl_ip += 2.0f * proj_q[j];
++            }
++        }
++    }
++    qjl_ip = warp_reduce_sum(qjl_ip);
++
++    if (lane == 0) {
++        const float score = term1 + outlier_term + residual_norm * correction_scale * qjl_ip;
++        char * out_ptr = reinterpret_cast<char *>(dst)
++                + kv_tok * sizeof(float)
++                + q_tok * dst_nb1
++                + q_head * dst_nb2
++                + stream * dst_nb3;
++        *reinterpret_cast<float *>(out_ptr) = score;
++    }
++}
++
++} // namespace
++
++bool turboquant_score_prod_cuda_raw(
++        const std::vector<float> & queries_flat,
++        const std::vector<float> & dataset_flat,
++        const std::vector<float> & mse_flat,
++        const std::vector<int8_t> & qjl_signs_flat,
++        const std::vector<float> & residual_norms,
++        const std::vector<float> & qjl_matrix,
++        int nq,
++        int nk,
++        int dim,
++        int qjl_dim,
++        turboquant_metrics & metrics_out,
++        std::string & error_out) {
++    metrics_out = {};
++    error_out.clear();
++
++    try {
++        if (nq <= 0 || nk <= 0 || dim <= 0 || qjl_dim <= 0) {
++            error_out = "invalid TurboQuant CUDA dimensions";
++            return false;
++        }
++
++        if ((int) queries_flat.size() != nq * dim ||
++            (int) dataset_flat.size() != nk * dim ||
++            (int) mse_flat.size() != nk * dim ||
++            (int) qjl_signs_flat.size() != nk * qjl_dim ||
++            (int) residual_norms.size() != nk ||
++            (int) qjl_matrix.size() != qjl_dim * dim) {
++            error_out = "TurboQuant CUDA scorer input size mismatch";
++            return false;
++        }
++
++        const int pair_count = nq * nk;
++        const float correction_scale = std::sqrt(3.14159265358979323846f / 2.0f) / float(qjl_dim);
++
++        cuda_buffer d_queries;
++        cuda_buffer d_dataset;
++        cuda_buffer d_projected;
++        cuda_buffer d_mse;
++        cuda_buffer d_signs;
++        cuda_buffer d_residual_norms;
++        cuda_buffer d_qjl_matrix;
++        cuda_buffer d_truth;
++        cuda_buffer d_scores;
++
++        cuda_check(cudaMalloc(&d_queries.ptr, queries_flat.size() * sizeof(float)), "cudaMalloc queries");
++        cuda_check(cudaMalloc(&d_dataset.ptr, dataset_flat.size() * sizeof(float)), "cudaMalloc dataset");
++        cuda_check(cudaMalloc(&d_projected.ptr, size_t(nq) * qjl_dim * sizeof(float)), "cudaMalloc projected queries");
++        cuda_check(cudaMalloc(&d_mse.ptr, mse_flat.size() * sizeof(float)), "cudaMalloc mse vectors");
++        cuda_check(cudaMalloc(&d_signs.ptr, qjl_signs_flat.size() * sizeof(int8_t)), "cudaMalloc qjl signs");
++        cuda_check(cudaMalloc(&d_residual_norms.ptr, residual_norms.size() * sizeof(float)), "cudaMalloc residual norms");
++        cuda_check(cudaMalloc(&d_qjl_matrix.ptr, qjl_matrix.size() * sizeof(float)), "cudaMalloc qjl matrix");
++        cuda_check(cudaMalloc(&d_truth.ptr, size_t(pair_count) * sizeof(float)), "cudaMalloc truth");
++        cuda_check(cudaMalloc(&d_scores.ptr, size_t(pair_count) * sizeof(float)), "cudaMalloc scores");
++
++        cuda_check(cudaMemcpy(d_queries.ptr, queries_flat.data(), queries_flat.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy queries");
++        cuda_check(cudaMemcpy(d_dataset.ptr, dataset_flat.data(), dataset_flat.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy dataset");
++        cuda_check(cudaMemcpy(d_mse.ptr, mse_flat.data(), mse_flat.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy mse vectors");
++        cuda_check(cudaMemcpy(d_signs.ptr, qjl_signs_flat.data(), qjl_signs_flat.size() * sizeof(int8_t), cudaMemcpyHostToDevice), "cudaMemcpy qjl signs");
++        cuda_check(cudaMemcpy(d_residual_norms.ptr, residual_norms.data(), residual_norms.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy residual norms");
++        cuda_check(cudaMemcpy(d_qjl_matrix.ptr, qjl_matrix.data(), qjl_matrix.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy qjl matrix");
++
++        const int block = 256;
++        const int project_total = nq * qjl_dim;
++
++        turboquant_project_queries_kernel<<<(project_total + block - 1) / block, block>>>(
++            static_cast<const float *>(d_queries.ptr),
++            static_cast<const float *>(d_qjl_matrix.ptr),
++            static_cast<float *>(d_projected.ptr),
++            nq,
++            qjl_dim,
++            dim);
++        cuda_check(cudaGetLastError(), "turboquant_project_queries_kernel launch");
++
++        turboquant_score_kernel<<<(pair_count + block - 1) / block, block>>>(
++            static_cast<const float *>(d_queries.ptr),
++            static_cast<const float *>(d_dataset.ptr),
++            static_cast<const float *>(d_projected.ptr),
++            static_cast<const float *>(d_mse.ptr),
++            static_cast<const int8_t *>(d_signs.ptr),
++            static_cast<const float *>(d_residual_norms.ptr),
++            static_cast<float *>(d_truth.ptr),
++            static_cast<float *>(d_scores.ptr),
++            nq,
++            nk,
++            dim,
++            qjl_dim,
++            correction_scale);
++        cuda_check(cudaGetLastError(), "turboquant_score_kernel launch");
++        cuda_check(cudaDeviceSynchronize(), "cudaDeviceSynchronize");
++
++        std::vector<float> truth = std::vector<float>(static_cast<size_t>(pair_count));
++        std::vector<float> scores = std::vector<float>(static_cast<size_t>(pair_count));
++        cuda_check(cudaMemcpy(truth.data(), d_truth.ptr, truth.size() * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy truth");
++        cuda_check(cudaMemcpy(scores.data(), d_scores.ptr, scores.size() * sizeof(float), cudaMemcpyDeviceToHost), "cudaMemcpy scores");
++
++        double bias_sum = 0.0;
++        double abs_sum = 0.0;
++        double sq_sum = 0.0;
++        for (int i = 0; i < pair_count; ++i) {
++            const double err = double(scores[i]) - double(truth[i]);
++            bias_sum += err;
++            abs_sum += std::abs(err);
++            sq_sum += err * err;
++        }
++
++        metrics_out.ip_bias_mean = bias_sum / double(pair_count);
++        metrics_out.ip_rmse = std::sqrt(sq_sum / double(pair_count));
++        metrics_out.ip_mae = abs_sum / double(pair_count);
++        return true;
++    } catch (const std::exception & exc) {
++        error_out = exc.what();
++        return false;
++    }
++}
++
++bool ggml_cuda_op_turboquant_exact_supported(const ggml_tensor * dst) {
++    if (dst->op != GGML_OP_CUSTOM || dst->src[0] == nullptr || dst->src[1] == nullptr) {
++        return false;
++    }
++    if (dst->src[0]->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (dst->src[1]->type != GGML_TYPE_F32 && dst->src[1]->type != GGML_TYPE_I8) {
++        return false;
++    }
++    if (dst->src[1]->type == GGML_TYPE_F32 && dst->src[0]->ne[0] != dst->src[1]->ne[0]) {
++        return false;
++    }
++    return true;
++}
++
++bool ggml_cuda_op_turboquant_pack_supported(const ggml_tensor * dst) {
++    if (dst->op != GGML_OP_CUSTOM || dst->src[0] == nullptr) {
++        return false;
++    }
++    if (dst->type != GGML_TYPE_I8 || dst->src[0]->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (dst->src[1] != nullptr) {
++        return false;
++    }
++    if (dst->ne[2] != 1 || dst->ne[3] != 1) {
++        return false;
++    }
++    if (dst->src[0]->ne[1] <= 0 || dst->src[0]->ne[2] <= 0) {
++        return false;
++    }
++
++    const int dim = static_cast<int>(dst->src[0]->ne[0]);
++    const int n_head = static_cast<int>(dst->src[0]->ne[1]);
++    const int bits = std::max(2, turboquant_env_int("LLAMA_ARG_TURBOQUANT_BITS", 4));
++    const int explicit_qjl = turboquant_env_int("LLAMA_ARG_TURBOQUANT_QJL_DIM", 0);
++    const int qjl_mult = std::max(1, turboquant_env_int("LLAMA_ARG_TURBOQUANT_QJL_MULT", 2));
++    const int qjl_dim = explicit_qjl > 0 ? explicit_qjl : dim * qjl_mult;
++    const int outlier_channels = std::max(0, turboquant_env_int("LLAMA_ARG_TURBOQUANT_OUTLIERS", std::max(0, dim / 32)));
++    auto params = get_turboquant_exact_device_params(dim, bits, qjl_dim, outlier_channels);
++
++    return dst->ne[0] == int64_t(params->layout.packed_bytes) * n_head;
++}
++
++__global__ void turboquant_fattn_kernel(
++        const float * __restrict__ queries,
++        const float * __restrict__ rotated_queries,
++        const float * __restrict__ projected_queries,
++        const int8_t * __restrict__ packed_keys,
++        const char * __restrict__ values,
++        const half * __restrict__ mask,
++        const float * __restrict__ centroids,
++        float * __restrict__ dst,
++        int dim,
++        int value_dim,
++        int mse_bits,
++        int qjl_dim,
++        int outlier_channels,
++        int n_sign_words,
++        int vec_norm_offset,
++        int residual_norm_offset,
++        int sign_words_offset,
++        int outlier_indices_offset,
++        int outlier_values_offset,
++        int n_q,
++        int n_k,
++        int n_head_q,
++        int n_head_k,
++        int n_stream,
++        int64_t q_nb1,
++        int64_t q_nb2,
++        int64_t q_nb3,
++        int64_t k_nb1,
++        int64_t k_nb2,
++        int64_t k_nb3,
++        int64_t v_nb1,
++        int64_t v_nb2,
++        int64_t v_nb3,
++        int64_t dst_nb1,
++        int64_t dst_nb2,
++        int64_t dst_nb3,
++        int32_t v_type,
++        int64_t mask_ne2,
++        int64_t mask_ne3,
++        int64_t mask_nb1,
++        int64_t mask_nb2,
++        int64_t mask_nb3,
++        float correction_scale,
++        float scale) {
++    constexpr int MAX_VALUES_PER_THREAD = 8;
++
++    const int qrow = blockIdx.x;
++    const int tid = threadIdx.x;
++    const int lane = tid & 31;
++
++    if (qrow >= n_q * n_head_q * n_stream) {
++        return;
++    }
++
++    const int q_tok = qrow % n_q;
++    const int q_head_stream = qrow / n_q;
++    const int q_head = q_head_stream % n_head_q;
++    const int stream = q_head_stream / n_head_q;
++    const int kv_head = (q_head * n_head_k) / n_head_q;
++
++    const char * q_ptr = reinterpret_cast<const char *>(queries)
++            + q_tok * q_nb1
++            + q_head * q_nb2
++            + stream * q_nb3;
++    const float * q = reinterpret_cast<const float *>(q_ptr);
++    const float * rot_q = rotated_queries + qrow * dim;
++    const float * proj_q = projected_queries + qrow * qjl_dim;
++    float proj_q_total = 0.0f;
++    if (tid < 32) {
++        for (int j = lane; j < qjl_dim; j += 32) {
++            proj_q_total += proj_q[j];
++        }
++        proj_q_total = warp_reduce_sum(proj_q_total);
++    }
++
++    int out_count = 0;
++    int out_dims[MAX_VALUES_PER_THREAD];
++    float out_acc[MAX_VALUES_PER_THREAD];
++    for (int d = tid; d < value_dim && out_count < MAX_VALUES_PER_THREAD; d += blockDim.x) {
++        out_dims[out_count] = d;
++        out_acc[out_count] = 0.0f;
++        ++out_count;
++    }
++
++    __shared__ float sh_score;
++    __shared__ float sh_m;
++    __shared__ float sh_l;
++    __shared__ float sh_alpha;
++    __shared__ float sh_beta;
++
++    if (tid == 0) {
++        sh_m = -INFINITY;
++        sh_l = 0.0f;
++        sh_alpha = 0.0f;
++        sh_beta = 0.0f;
++    }
++    __syncthreads();
++
++    for (int kv_tok = 0; kv_tok < n_k; ++kv_tok) {
++        float term1 = 0.0f;
++        float outlier_term = 0.0f;
++        float qjl_ip = 0.0f;
++
++        if (tid < 32) {
++            const int8_t * packed_row = packed_keys
++                    + kv_tok * k_nb1
++                    + kv_head * k_nb2
++                    + stream * k_nb3;
++            const uint8_t * idxs = reinterpret_cast<const uint8_t *>(packed_row);
++            const float vec_norm = *reinterpret_cast<const float *>(packed_row + vec_norm_offset);
++            const float residual_norm = *reinterpret_cast<const float *>(packed_row + residual_norm_offset);
++            const uint32_t * words = reinterpret_cast<const uint32_t *>(packed_row + sign_words_offset);
++            const uint16_t * outlier_indices = outlier_channels > 0 ? reinterpret_cast<const uint16_t *>(packed_row + outlier_indices_offset) : nullptr;
++            const float * outlier_values = outlier_channels > 0 ? reinterpret_cast<const float *>(packed_row + outlier_values_offset) : nullptr;
++
++            for (int i = lane; i < dim; i += 32) {
++                term1 += rot_q[i] * centroids[turboquant_load_code_device(idxs, i, mse_bits)];
++            }
++            term1 = warp_reduce_sum(term1) * vec_norm;
++
++            for (int oi = lane; oi < outlier_channels; oi += 32) {
++                const uint16_t idx = outlier_indices[oi];
++                outlier_term += q[idx] * outlier_values[oi];
++            }
++            outlier_term = warp_reduce_sum(outlier_term);
++
++            qjl_ip = -proj_q_total;
++            for (int w = lane; w < n_sign_words; w += 32) {
++                const uint32_t bits = words[w];
++                const int base = w * 32;
++                for (int b = 0; b < 32; ++b) {
++                    const int j = base + b;
++                    if (j >= qjl_dim) {
++                        break;
++                    }
++                    if (bits & (1u << b)) {
++                        qjl_ip += 2.0f * proj_q[j];
++                    }
++                }
++            }
++            qjl_ip = warp_reduce_sum(qjl_ip);
++
++            if (lane == 0) {
++                float score = (term1 + outlier_term + residual_norm * correction_scale * qjl_ip) * scale;
++                if (mask != nullptr) {
++                    const char * mask_ptr = reinterpret_cast<const char *>(mask)
++                            + kv_tok * int64_t(sizeof(half))
++                            + q_tok * mask_nb1
++                            + (mask_ne2 > 0 ? (q_head % mask_ne2) * mask_nb2 : 0)
++                            + (mask_ne3 > 0 ? (stream % mask_ne3) * mask_nb3 : 0);
++                    score += __half2float(*reinterpret_cast<const half *>(mask_ptr));
++                }
++                const float new_m = fmaxf(sh_m, score);
++                sh_alpha = sh_l > 0.0f ? expf(sh_m - new_m) : 0.0f;
++                sh_beta = expf(score - new_m);
++                sh_m = new_m;
++                sh_l = sh_l * sh_alpha + sh_beta;
++                sh_score = score;
++            }
++        }
++        __syncthreads();
++
++        const char * v_base = reinterpret_cast<const char *>(values)
++                + kv_head * v_nb1
++                + kv_tok * v_nb2
++                + stream * v_nb3;
++        for (int i = 0; i < out_count; ++i) {
++            const float vv = turboquant_load_v_value(v_base, (ggml_type) v_type, out_dims[i]);
++            out_acc[i] = out_acc[i] * sh_alpha + sh_beta * vv;
++        }
++        __syncthreads();
++    }
++
++    const float inv_l = sh_l > 0.0f ? 1.0f / sh_l : 0.0f;
++    for (int i = 0; i < out_count; ++i) {
++        char * out_ptr = reinterpret_cast<char *>(dst)
++                + out_dims[i] * int64_t(sizeof(float))
++                + q_tok * dst_nb1
++                + q_head * dst_nb2
++                + stream * dst_nb3;
++        *reinterpret_cast<float *>(out_ptr) = out_acc[i] * inv_l;
++    }
++}
++
++bool ggml_cuda_op_turboquant_fattn_supported(const ggml_tensor * dst) {
++    if ((dst->op != GGML_OP_CUSTOM && dst->op != GGML_OP_FLASH_ATTN_EXT) || dst->src[0] == nullptr || dst->src[1] == nullptr || dst->src[2] == nullptr) {
++        return false;
++    }
++    if (dst->src[0]->type != GGML_TYPE_F32 || dst->src[1]->type != GGML_TYPE_I8 ||
++            (dst->src[2]->type != GGML_TYPE_F16 &&
++             dst->src[2]->type != GGML_TYPE_Q8_0 &&
++             dst->src[2]->type != GGML_TYPE_Q4_0 &&
++             dst->src[2]->type != GGML_TYPE_Q4_1 &&
++             dst->src[2]->type != GGML_TYPE_Q5_0 &&
++             dst->src[2]->type != GGML_TYPE_Q5_1) ||
++            dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (dst->src[3] != nullptr && dst->src[3]->type != GGML_TYPE_F16) {
++        return false;
++    }
++    return true;
++}
++
++__global__ void turboquant_pack_kcur_compact_kernel(
++        const float * __restrict__ keys,
++        int8_t * __restrict__ packed_out,
++        const float * __restrict__ rotation,
++        const float * __restrict__ boundaries,
++        const float * __restrict__ centroids,
++        const float * __restrict__ qjl_matrix,
++        int dim,
++        int mse_bits,
++        int qjl_dim,
++        int outlier_channels,
++        int n_sign_words,
++        int packed_head_bytes,
++        int vec_norm_offset,
++        int residual_norm_offset,
++        int sign_words_offset,
++        int outlier_indices_offset,
++        int outlier_values_offset,
++        int n_tokens,
++        int n_head,
++        int n_levels,
++        int64_t k_nb1,
++        int64_t k_nb2,
++        int64_t packed_nb1) {
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++    if (row >= n_tokens * n_head) {
++        return;
++    }
++
++    const int token = row / n_head;
++    const int head = row % n_head;
++
++    const char * key_ptr = reinterpret_cast<const char *>(keys)
++            + head * k_nb1
++            + token * k_nb2;
++    const float * key = reinterpret_cast<const float *>(key_ptr);
++    int8_t * packed_row = packed_out
++            + token * packed_nb1
++            + head * packed_head_bytes;
++
++    uint8_t * code_bytes = reinterpret_cast<uint8_t *>(packed_row);
++    float * vec_norm_out = reinterpret_cast<float *>(packed_row + vec_norm_offset);
++    float * residual_norm_out = reinterpret_cast<float *>(packed_row + residual_norm_offset);
++    uint32_t * sign_words_out = reinterpret_cast<uint32_t *>(packed_row + sign_words_offset);
++    uint16_t * outlier_idx_out = outlier_channels > 0 ? reinterpret_cast<uint16_t *>(packed_row + outlier_indices_offset) : nullptr;
++    float * outlier_val_out = outlier_channels > 0 ? reinterpret_cast<float *>(packed_row + outlier_values_offset) : nullptr;
++
++    extern __shared__ float shmem_compact[];
++    float * key_sh = shmem_compact;
++    float * rotated = key_sh + dim;
++    float * residual = rotated + dim;
++    uint16_t * compact_codes = reinterpret_cast<uint16_t *>(residual + dim);
++
++    for (int i = tid; i < dim; i += blockDim.x) {
++        key_sh[i] = key[i];
++    }
++    __syncthreads();
++
++    float norm_sq = 0.0f;
++    for (int i = tid; i < dim; i += blockDim.x) {
++        norm_sq += key_sh[i] * key_sh[i];
++    }
++    norm_sq = block_reduce_sum(norm_sq);
++    const float norm = norm_sq > 0.0f ? sqrtf(norm_sq) : 1.0f;
++    const float inv_norm = 1.0f / norm;
++    if (tid == 0) {
++        *vec_norm_out = norm;
++    }
++
++    for (int r = tid; r < dim; r += blockDim.x) {
++        float acc = 0.0f;
++        const float * rot_row = rotation + r * dim;
++        for (int c = 0; c < dim; ++c) {
++            acc += rot_row[c] * (key_sh[c] * inv_norm);
++        }
++        int idx = 0;
++        while (idx < n_levels - 1 && acc > boundaries[idx]) {
++            ++idx;
++        }
++        compact_codes[r] = static_cast<uint16_t>(idx);
++        rotated[r] = centroids[idx];
++    }
++    __syncthreads();
++
++    for (int byte_idx = tid; byte_idx < vec_norm_offset; byte_idx += blockDim.x) {
++        uint32_t packed = 0;
++        const int first_idx = (byte_idx * 8) / mse_bits;
++        const int last_idx = min(dim - 1, (((byte_idx + 1) * 8) - 1) / mse_bits);
++        for (int idx = first_idx; idx <= last_idx; ++idx) {
++            const int local_bit = idx * mse_bits - byte_idx * 8;
++            const uint32_t code = compact_codes[idx] & ((1u << mse_bits) - 1u);
++            if (local_bit >= 0) {
++                packed |= code << local_bit;
++            } else {
++                packed |= code >> (-local_bit);
++            }
++        }
++        code_bytes[byte_idx] = uint8_t(packed & 0xFFu);
++    }
++    __syncthreads();
++
++    for (int c = tid; c < dim; c += blockDim.x) {
++        float acc = 0.0f;
++        for (int r = 0; r < dim; ++r) {
++            acc += rotation[r * dim + c] * rotated[r];
++        }
++        residual[c] = key_sh[c] - acc * norm;
++    }
++    __syncthreads();
++
++    if (outlier_channels > 0 && tid == 0) {
++        for (int oi = 0; oi < outlier_channels; ++oi) {
++            int best_idx = 0;
++            float best_abs = -1.0f;
++            for (int c = 0; c < dim; ++c) {
++                const float absv = fabsf(residual[c]);
++                if (absv > best_abs) {
++                    best_abs = absv;
++                    best_idx = c;
++                }
++            }
++            outlier_idx_out[oi] = static_cast<uint16_t>(best_idx);
++            outlier_val_out[oi] = residual[best_idx];
++            residual[best_idx] = 0.0f;
++        }
++    }
++    __syncthreads();
++
++    float residual_sq = 0.0f;
++    for (int c = tid; c < dim; c += blockDim.x) {
++        residual_sq += residual[c] * residual[c];
++    }
++    residual_sq = block_reduce_sum(residual_sq);
++    if (tid == 0) {
++        *residual_norm_out = sqrtf(fmaxf(residual_sq, 0.0f));
++    }
++
++    for (int w = tid; w < n_sign_words; w += blockDim.x) {
++        uint32_t bits = 0;
++        for (int b = 0; b < 32; ++b) {
++            const int j = w * 32 + b;
++            if (j >= qjl_dim) {
++                break;
++            }
++            float acc = 0.0f;
++            const float * a = qjl_matrix + j * dim;
++            for (int c = 0; c < dim; ++c) {
++                acc += a[c] * residual[c];
++            }
++            if (acc >= 0.0f) {
++                bits |= (1u << b);
++            }
++        }
++        sign_words_out[w] = bits;
++    }
++}
++
++void ggml_cuda_op_turboquant_pack(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * k = dst->src[0];
++
++    const int dim = static_cast<int>(k->ne[0]);
++    const int src_n_head = static_cast<int>(k->ne[1]);
++    const int n_tokens = static_cast<int>(k->ne[2]);
++    const int bits = std::max(2, turboquant_env_int("LLAMA_ARG_TURBOQUANT_BITS", 4));
++    const int explicit_qjl = turboquant_env_int("LLAMA_ARG_TURBOQUANT_QJL_DIM", 0);
++    const int qjl_mult = std::max(1, turboquant_env_int("LLAMA_ARG_TURBOQUANT_QJL_MULT", 2));
++    const int qjl_dim = explicit_qjl > 0 ? explicit_qjl : dim * qjl_mult;
++    const int outlier_channels = std::max(0, turboquant_env_int("LLAMA_ARG_TURBOQUANT_OUTLIERS", std::max(0, dim / 32)));
++
++    auto params = get_turboquant_exact_device_params(dim, bits, qjl_dim, outlier_channels);
++    const int n_sign_words = (qjl_dim + 31) / 32;
++    const auto & layout = params->layout;
++    const int packed_head_bytes = layout.packed_bytes;
++    GGML_ASSERT(dst->ne[0] % packed_head_bytes == 0);
++    const int dst_n_head = static_cast<int>(dst->ne[0] / packed_head_bytes);
++    GGML_ASSERT(dst->ne[1] == n_tokens);
++    GGML_ASSERT(src_n_head == dst_n_head || src_n_head == 1);
++
++    const int total_rows = n_tokens * dst_n_head;
++    const int compress_threads = 128;
++    const size_t compress_shmem = size_t(3 * dim) * sizeof(float) + size_t(dim) * sizeof(uint16_t);
++    turboquant_pack_kcur_compact_kernel<<<total_rows, compress_threads, compress_shmem, ctx.stream()>>>(
++        static_cast<const float *>(k->data),
++        static_cast<int8_t *>(dst->data),
++        static_cast<const float *>(params->d_rotation.ptr),
++        static_cast<const float *>(params->d_boundaries.ptr),
++        static_cast<const float *>(params->d_centroids.ptr),
++        static_cast<const float *>(params->d_qjl_matrix.ptr),
++        dim,
++        params->mse_bits,
++        qjl_dim,
++        outlier_channels,
++        n_sign_words,
++        packed_head_bytes,
++        layout.vec_norm_offset,
++        layout.residual_norm_offset,
++        layout.sign_words_offset,
++        layout.outlier_indices_offset,
++        layout.outlier_values_offset,
++        n_tokens,
++        dst_n_head,
++        params->n_levels,
++        k->nb[1],
++        k->nb[2],
++        dst->nb[1]);
++    cuda_check(cudaGetLastError(), "turboquant_pack_kcur_compact_kernel launch");
++}
++
++void ggml_cuda_op_turboquant_fattn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    static bool logged_once = false;
++    if (!logged_once) {
++        GGML_LOG_INFO("%s: executing fused TurboQuant Flash Attention on CUDA\n", __func__);
++        logged_once = true;
++    }
++
++    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * k = dst->src[1];
++    const ggml_tensor * v = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++
++    const int dim = static_cast<int>(q->ne[0]);
++    const int value_dim = static_cast<int>(v->ne[0]);
++    const int n_head_q = static_cast<int>(q->ne[1]);
++    const int n_q = static_cast<int>(q->ne[2]);
++    const int n_stream = static_cast<int>(q->ne[3]);
++    const int n_head_k = static_cast<int>(k->ne[2]);
++    const int n_k = static_cast<int>(k->ne[1]);
++
++    const int bits = std::max(2, turboquant_env_int("LLAMA_ARG_TURBOQUANT_BITS", 4));
++    const int explicit_qjl = turboquant_env_int("LLAMA_ARG_TURBOQUANT_QJL_DIM", 0);
++    const int qjl_mult = std::max(1, turboquant_env_int("LLAMA_ARG_TURBOQUANT_QJL_MULT", 2));
++    const int qjl_dim = explicit_qjl > 0 ? explicit_qjl : dim * qjl_mult;
++    const int outlier_channels = std::max(0, turboquant_env_int("LLAMA_ARG_TURBOQUANT_OUTLIERS", std::max(0, dim / 32)));
++    const auto params = get_turboquant_exact_device_params(dim, bits, qjl_dim, outlier_channels);
++    const auto & layout = params->layout;
++    const int n_sign_words = (qjl_dim + 31) / 32;
++
++    cuda_buffer d_projected_queries;
++    cuda_buffer d_rotated_queries;
++    const int qrow_total = n_q * n_head_q * n_stream;
++    cuda_check(cudaMalloc(&d_projected_queries.ptr, size_t(qrow_total) * qjl_dim * sizeof(float)), "cudaMalloc turboquant fused projected queries");
++    cuda_check(cudaMalloc(&d_rotated_queries.ptr, size_t(qrow_total) * dim * sizeof(float)), "cudaMalloc turboquant fused rotated queries");
++
++    const size_t query_shmem = size_t(dim) * sizeof(float);
++    turboquant_rotate_project_qrows_kernel<<<qrow_total, 128, query_shmem, ctx.stream()>>>(
++        static_cast<const float *>(q->data),
++        static_cast<float *>(d_rotated_queries.ptr),
++        static_cast<float *>(d_projected_queries.ptr),
++        static_cast<const float *>(params->d_rotation.ptr),
++        static_cast<const float *>(params->d_qjl_matrix.ptr),
++        dim,
++        qjl_dim,
++        n_q,
++        n_head_q,
++        n_stream,
++        q->nb[1],
++        q->nb[2],
++        q->nb[3]);
++    cuda_check(cudaGetLastError(), "turboquant_rotate_project_qrows_kernel fused launch");
++
++    const float correction_scale = params->correction_scale;
++    const float scale = 1.0f / sqrtf(float(dim));
++    turboquant_fattn_kernel<<<qrow_total, 128, 0, ctx.stream()>>>(
++        static_cast<const float *>(q->data),
++        static_cast<const float *>(d_rotated_queries.ptr),
++        static_cast<const float *>(d_projected_queries.ptr),
++        static_cast<const int8_t *>(k->data),
++        static_cast<const char *>(v->data),
++        mask ? reinterpret_cast<const half *>(mask->data) : nullptr,
++        static_cast<const float *>(params->d_centroids.ptr),
++        static_cast<float *>(dst->data),
++        dim,
++        value_dim,
++        params->mse_bits,
++        qjl_dim,
++        outlier_channels,
++        n_sign_words,
++        layout.vec_norm_offset,
++        layout.residual_norm_offset,
++        layout.sign_words_offset,
++        layout.outlier_indices_offset,
++        layout.outlier_values_offset,
++        n_q,
++        n_k,
++        n_head_q,
++        n_head_k,
++        n_stream,
++        q->nb[1],
++        q->nb[2],
++        q->nb[3],
++        k->nb[1],
++        k->nb[2],
++        k->nb[3],
++        v->nb[1],
++        v->nb[2],
++        v->nb[3],
++        dst->nb[1],
++        dst->nb[2],
++        dst->nb[3],
++        int32_t(v->type),
++        mask ? mask->ne[2] : 0,
++        mask ? mask->ne[3] : 0,
++        mask ? mask->nb[1] : 0,
++        mask ? mask->nb[2] : 0,
++        mask ? mask->nb[3] : 0,
++        correction_scale,
++        scale);
++    cuda_check(cudaGetLastError(), "turboquant_fattn_kernel launch");
++}
++
++void ggml_cuda_op_turboquant_exact(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    static bool logged_once = false;
++    const bool first_log = !logged_once;
++    if (!logged_once) {
++        GGML_LOG_INFO("%s: executing live TurboQuant exact KQ on CUDA\n", __func__);
++        logged_once = true;
++    }
++
++    const ggml_tensor * q = dst->src[0];
++    const ggml_tensor * k = dst->src[1];
++
++    const int dim = static_cast<int>(q->ne[0]);
++    const int n_q = static_cast<int>(q->ne[1]);
++    const int n_head_q = static_cast<int>(q->ne[2]);
++    const int n_stream = static_cast<int>(q->ne[3]);
++    const int n_k = static_cast<int>(k->ne[1]);
++    const int n_head_k = static_cast<int>(k->ne[2]);
++
++    const int bits = std::max(2, turboquant_env_int("LLAMA_ARG_TURBOQUANT_BITS", 4));
++    const int explicit_qjl = turboquant_env_int("LLAMA_ARG_TURBOQUANT_QJL_DIM", 0);
++    const int qjl_mult = std::max(1, turboquant_env_int("LLAMA_ARG_TURBOQUANT_QJL_MULT", 2));
++    const int qjl_dim = explicit_qjl > 0 ? explicit_qjl : dim * qjl_mult;
++    const int outlier_channels = std::max(0, turboquant_env_int("LLAMA_ARG_TURBOQUANT_OUTLIERS", std::max(0, dim / 32)));
++    const bool cache_enabled = turboquant_env_int("LLAMA_ARG_TURBOQUANT_CACHE", 1) != 0;
++
++    auto params = get_turboquant_exact_device_params(dim, bits, qjl_dim, outlier_channels);
++
++    const int nkv_rows = n_k * n_head_k * n_stream;
++    const int qrow_total = n_q * n_head_q * n_stream;
++    const int n_sign_words = (qjl_dim + 31) / 32;
++    const auto & layout = params->layout;
++    cuda_buffer d_projected_queries;
++    cuda_buffer d_rotated_queries;
++    cuda_check(cudaMalloc(&d_projected_queries.ptr, size_t(qrow_total) * qjl_dim * sizeof(float)), "cudaMalloc turboquant projected queries");
++    cuda_check(cudaMalloc(&d_rotated_queries.ptr, size_t(qrow_total) * dim * sizeof(float)), "cudaMalloc turboquant rotated queries");
++
++    std::shared_ptr<turboquant_exact_key_cache_entry> key_cache;
++    cuda_buffer d_packed_tmp;
++    const int8_t * packed_ptr = nullptr;
++
++    int row_offset = 0;
++    int rows_to_compress = nkv_rows;
++
++    if (k->type == GGML_TYPE_I8) {
++        packed_ptr = static_cast<const int8_t *>(k->data);
++        rows_to_compress = 0;
++    } else if (cache_enabled) {
++        const turboquant_exact_cache_key key = {
++            k->data,
++            dim,
++            bits,
++            qjl_dim,
++            outlier_channels,
++            n_head_k,
++            n_stream,
++        };
++        key_cache = get_turboquant_exact_key_cache(key, nkv_rows, layout.packed_bytes);
++        if (key_cache->last_rows_seen >= 0 && nkv_rows < key_cache->last_rows_seen) {
++            key_cache->compressed_rows = 0;
++        }
++        key_cache->last_rows_seen = nkv_rows;
++        row_offset = std::min(key_cache->compressed_rows, nkv_rows);
++        rows_to_compress = nkv_rows - row_offset;
++        packed_ptr = static_cast<const int8_t *>(key_cache->d_packed.ptr);
++    } else {
++        cuda_check(cudaMalloc(&d_packed_tmp.ptr, size_t(nkv_rows) * layout.packed_bytes), "cudaMalloc turboquant packed rows");
++        packed_ptr = static_cast<const int8_t *>(d_packed_tmp.ptr);
++    }
++
++    const int compress_threads = 128;
++    const size_t compress_shmem = size_t(3 * dim) * sizeof(float) + size_t(dim) * sizeof(uint16_t);
++    if (rows_to_compress > 0) {
++        turboquant_compress_keys_compact_kernel<<<rows_to_compress, compress_threads, compress_shmem, ctx.stream()>>>(
++            static_cast<const float *>(k->data),
++            const_cast<int8_t *>(packed_ptr),
++            static_cast<const float *>(params->d_rotation.ptr),
++            static_cast<const float *>(params->d_boundaries.ptr),
++            static_cast<const float *>(params->d_centroids.ptr),
++            static_cast<const float *>(params->d_qjl_matrix.ptr),
++            dim,
++            params->mse_bits,
++            qjl_dim,
++            outlier_channels,
++            n_sign_words,
++            layout.packed_bytes,
++            layout.vec_norm_offset,
++            layout.residual_norm_offset,
++            layout.sign_words_offset,
++            layout.outlier_indices_offset,
++            layout.outlier_values_offset,
++            nkv_rows,
++            row_offset,
++            params->n_levels,
++            n_k,
++            n_head_k,
++            n_stream,
++            k->nb[1],
++            k->nb[2],
++            k->nb[3],
++            layout.packed_bytes * n_head_k,
++            layout.packed_bytes,
++            layout.packed_bytes * n_head_k * n_k);
++        cuda_check(cudaGetLastError(), "turboquant_compress_keys_compact_kernel launch");
++        if (key_cache) {
++            key_cache->compressed_rows = nkv_rows;
++        }
++    }
++
++    const int block = 128;
++    const size_t query_shmem = size_t(dim) * sizeof(float);
++    turboquant_rotate_project_qrows_kernel<<<qrow_total, 128, query_shmem, ctx.stream()>>>(
++        static_cast<const float *>(q->data),
++        static_cast<float *>(d_rotated_queries.ptr),
++        static_cast<float *>(d_projected_queries.ptr),
++        static_cast<const float *>(params->d_rotation.ptr),
++        static_cast<const float *>(params->d_qjl_matrix.ptr),
++        dim,
++        qjl_dim,
++        n_q,
++        n_head_q,
++        n_stream,
++        q->nb[1],
++        q->nb[2],
++        q->nb[3]);
++    cuda_check(cudaGetLastError(), "turboquant_rotate_project_qrows_kernel launch");
++
++    if (first_log) {
++        const size_t compressed_bytes = size_t(nkv_rows) * layout.packed_bytes;
++        const size_t f16_k_bytes = size_t(nkv_rows) * dim * sizeof(uint16_t);
++        const float ratio = f16_k_bytes > 0 ? float(compressed_bytes) / float(f16_k_bytes) : 1.0f;
++        GGML_LOG_INFO("%s: TurboQuant compact K sidecar = %.2f MiB vs f16-K %.2f MiB (ratio %.3fx, savings %.2f%%)\n",
++                __func__,
++                compressed_bytes / 1024.0 / 1024.0,
++                f16_k_bytes / 1024.0 / 1024.0,
++                ratio,
++                100.0f * (1.0f - ratio));
++    }
++
++    dim3 score_grid(qrow_total, (n_k + block - 1) / block, 1);
++    turboquant_kq_compact_kernel<<<score_grid, block, 0, ctx.stream()>>>(
++        static_cast<const float *>(q->data),
++        static_cast<const float *>(d_rotated_queries.ptr),
++        static_cast<const float *>(d_projected_queries.ptr),
++        packed_ptr,
++        static_cast<const float *>(params->d_centroids.ptr),
++        static_cast<float *>(dst->data),
++        dim,
++        params->mse_bits,
++        qjl_dim,
++        outlier_channels,
++        n_sign_words,
++        layout.packed_bytes,
++        layout.vec_norm_offset,
++        layout.residual_norm_offset,
++        layout.sign_words_offset,
++        layout.outlier_indices_offset,
++        layout.outlier_values_offset,
++        n_q,
++        n_k,
++        n_head_q,
++        n_head_k,
++        n_stream,
++        q->nb[1],
++        q->nb[2],
++        q->nb[3],
++        k->nb[1],
++        k->nb[2],
++        k->nb[3],
++        dst->nb[1],
++        dst->nb[2],
++        dst->nb[3],
++        params->correction_scale);
++    cuda_check(cudaGetLastError(), "turboquant_kq_compact_kernel launch");
++}
++
++} // namespace llama_lab
+diff --git a/tools/turboquant-bench/turboquant-bench.cpp b/tools/turboquant-bench/turboquant-bench.cpp
+new file mode 100644
+index 0000000..ddb4ae1
+--- /dev/null
++++ b/tools/turboquant-bench/turboquant-bench.cpp
+@@ -0,0 +1,144 @@
++#include "common.h"
++#include "turboquant.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <iostream>
++#include <string>
++#include <vector>
++
++using namespace llama_lab;
++
++namespace {
++
++struct bench_args {
++    int dim = 128;
++    int bits = 4;
++    int qjl_dim = 0;
++    int samples = 256;
++    int queries = 64;
++    int seed = 42;
++    int codebook_iters = 96;
++    int codebook_grid = 4096;
++};
++
++void print_usage() {
++    std::cout
++        << "usage: llama-turboquant-bench [options]\n"
++        << "  --dim N              vector dimension (default: 128)\n"
++        << "  --bits N             total TurboQuant bit budget (default: 4)\n"
++        << "  --qjl-dim N          QJL projection dimension (default: dim)\n"
++        << "  --samples N          dataset vectors (default: 256)\n"
++        << "  --queries N          query vectors (default: 64)\n"
++        << "  --seed N             RNG seed (default: 42)\n"
++        << "  --codebook-iters N   Lloyd-Max iterations (default: 96)\n"
++        << "  --codebook-grid N    Gaussian grid points (default: 4096)\n";
++}
++
++bool parse_int_arg(const char * value, int & out) {
++    char * end = nullptr;
++    const long parsed = std::strtol(value, &end, 10);
++    if (!end || *end != '\0') {
++        return false;
++    }
++    out = static_cast<int>(parsed);
++    return true;
++}
++
++bench_args parse_args(int argc, char ** argv) {
++    bench_args args;
++    for (int i = 1; i < argc; ++i) {
++        const std::string flag = argv[i];
++        auto need_value = [&](int & slot) {
++            if (i + 1 >= argc || !parse_int_arg(argv[++i], slot)) {
++                throw std::runtime_error("invalid value for " + flag);
++            }
++        };
++
++        if (flag == "-h" || flag == "--help") {
++            print_usage();
++            std::exit(0);
++        } else if (flag == "--dim") {
++            need_value(args.dim);
++        } else if (flag == "--bits") {
++            need_value(args.bits);
++        } else if (flag == "--qjl-dim") {
++            need_value(args.qjl_dim);
++        } else if (flag == "--samples") {
++            need_value(args.samples);
++        } else if (flag == "--queries") {
++            need_value(args.queries);
++        } else if (flag == "--seed") {
++            need_value(args.seed);
++        } else if (flag == "--codebook-iters") {
++            need_value(args.codebook_iters);
++        } else if (flag == "--codebook-grid") {
++            need_value(args.codebook_grid);
++        } else {
++            throw std::runtime_error("unknown argument: " + flag);
++        }
++    }
++
++    if (args.dim <= 0 || args.bits <= 1 || args.samples <= 0 || args.queries <= 0) {
++        throw std::runtime_error("invalid benchmark parameters");
++    }
++    return args;
++}
++
++std::vector<std::vector<float>> make_vectors(int count, int dim, uint64_t seed) {
++    std::vector<std::vector<float>> out;
++    out.reserve(count);
++    for (int i = 0; i < count; ++i) {
++        out.push_back(turboquant_make_unit_vector(dim, seed, static_cast<uint64_t>(i)));
++    }
++    return out;
++}
++
++} // namespace
++
++int main(int argc, char ** argv) {
++    try {
++        const bench_args args = parse_args(argc, argv);
++
++        turboquant_init_params params;
++        params.dim = args.dim;
++        params.bits = args.bits;
++        params.qjl_dim = args.qjl_dim;
++        params.seed = static_cast<uint64_t>(args.seed);
++        params.codebook_iters = args.codebook_iters;
++        params.codebook_grid = args.codebook_grid;
++
++        const auto dataset = make_vectors(args.samples, args.dim, params.seed + 1);
++        const auto queries = make_vectors(args.queries, args.dim, params.seed + 2);
++
++        turboquant_mse mse_quant(params);
++        turboquant_init_params prod_mse_params = params;
++        prod_mse_params.bits = std::max(1, args.bits - 1);
++        turboquant_mse prod_mse_quant(prod_mse_params);
++        turboquant_prod prod_quant(params);
++
++        const auto mse_metrics = turboquant_score_mse(mse_quant, dataset);
++        const auto prod_mse_metrics = turboquant_score_mse(prod_mse_quant, dataset);
++        const auto prod_reference_ip_metrics = turboquant_score_mse_inner_products(prod_mse_quant, dataset, queries);
++        const auto prod_metrics = turboquant_score_prod(prod_quant, dataset, queries);
++
++        std::cout
++            << "{"
++            << "\"dim\":" << args.dim << ","
++            << "\"bits\":" << args.bits << ","
++            << "\"prod_mse_bits\":" << std::max(1, args.bits - 1) << ","
++            << "\"qjl_dim\":" << (args.qjl_dim > 0 ? args.qjl_dim : args.dim) << ","
++            << "\"samples\":" << args.samples << ","
++            << "\"queries\":" << args.queries << ","
++            << "\"mse_stage\":" << turboquant_metrics_json(mse_metrics) << ","
++            << "\"prod_reference_mse_stage\":" << turboquant_metrics_json(prod_mse_metrics) << ","
++            << "\"prod_reference_ip_stage\":" << turboquant_metrics_json(prod_reference_ip_metrics) << ","
++            << "\"prod_stage\":" << turboquant_metrics_json(prod_metrics)
++            << "}\n";
++
++        return 0;
++    } catch (const std::exception & exc) {
++        std::fprintf(stderr, "llama-turboquant-bench: %s\n", exc.what());
++        return 1;
++    }
++}
+diff --git a/tools/turboquant-probe/turboquant-probe.cpp b/tools/turboquant-probe/turboquant-probe.cpp
+new file mode 100644
+index 0000000..d9a79b7
+--- /dev/null
++++ b/tools/turboquant-probe/turboquant-probe.cpp
+@@ -0,0 +1,466 @@
++#include "arg.h"
++#include "common.h"
++#include "ggml.h"
++#include "llama.h"
++#include "turboquant.h"
++#include "turboquant-probe-cuda.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++#include <stdexcept>
++#include <string>
++#include <utility>
++#include <vector>
++
++using namespace llama_lab;
++
++namespace {
++
++struct probe_args {
++    int layer = 0;
++    int bits = 4;
++    int qjl_dim = 0;
++    int max_vectors = 512;
++    int max_prompt_tokens = 256;
++    int probe_ctx = 1024;
++    bool use_gpu = true;
++    bool use_cuda_exact = true;
++};
++
++struct captured_tensor {
++    std::string name;
++    std::vector<std::vector<float>> vectors;
++    std::vector<char> raw;
++    int64_t ne[4] = {0, 0, 0, 0};
++    size_t nb[4] = {0, 0, 0, 0};
++    ggml_type type = GGML_TYPE_COUNT;
++};
++
++struct probe_collector {
++    std::mutex mutex;
++    std::string q_name;
++    std::string k_name;
++    int max_vectors = 0;
++    captured_tensor q_capture;
++    captured_tensor k_capture;
++    std::vector<std::string> seen_names;
++
++    static std::string normalize_name(const char * raw_name) {
++        if (raw_name == nullptr) {
++            return {};
++        }
++        std::string name = raw_name;
++        const char * p = std::strchr(raw_name, '#');
++        if (p != nullptr) {
++            p += 1;
++            const char * q = std::strchr(p, '#');
++            if (q != nullptr) {
++                name.assign(p, q - p);
++            } else {
++                name.assign(p);
++            }
++        }
++        return name;
++    }
++
++    bool wants(const ggml_tensor * t) const {
++        if (t->name[0] == '\0') {
++            return false;
++        }
++        const std::string name = normalize_name(t->name);
++        return q_name == name || k_name == name;
++    }
++};
++
++static float tensor_scalar_to_f32(const char * base, ggml_type type, int64_t element_idx) {
++    switch (type) {
++        case GGML_TYPE_F32:
++            return reinterpret_cast<const float *>(base)[element_idx];
++        case GGML_TYPE_F16:
++            return ggml_fp16_to_fp32(reinterpret_cast<const ggml_fp16_t *>(base)[element_idx]);
++        case GGML_TYPE_BF16:
++            return ggml_bf16_to_fp32(reinterpret_cast<const ggml_bf16_t *>(base)[element_idx]);
++        default:
++            throw std::runtime_error(std::string("unsupported tensor type for probe: ") + ggml_type_name(type));
++    }
++}
++
++static std::vector<std::vector<float>> unpack_attention_vectors(
++        const captured_tensor & t,
++        int max_vectors,
++        int expected_head_dim = 0) {
++    if (t.ne[0] <= 0 || t.ne[1] <= 0) {
++        throw std::runtime_error("unexpected tensor shape for TurboQuant probe");
++    }
++
++    int dim = static_cast<int>(t.ne[0]);
++    int heads = static_cast<int>(std::max<int64_t>(1, t.ne[1]));
++    int tokens = static_cast<int>(std::max<int64_t>(1, t.ne[2]));
++    int streams = static_cast<int>(std::max<int64_t>(1, t.ne[3]));
++
++    bool merged_kv = false;
++    if (expected_head_dim > 0 && t.ne[2] == 1 && t.ne[3] == 1 && t.ne[0] % expected_head_dim == 0) {
++        dim = expected_head_dim;
++        heads = static_cast<int>(t.ne[0] / expected_head_dim);
++        tokens = static_cast<int>(t.ne[1]);
++        streams = 1;
++        merged_kv = true;
++    }
++
++    std::vector<std::vector<float>> out;
++    out.reserve(std::min(max_vectors, heads * tokens * streams));
++
++    const char * base = t.raw.data();
++    for (int s = 0; s < streams && (int) out.size() < max_vectors; ++s) {
++        for (int tok = 0; tok < tokens && (int) out.size() < max_vectors; ++tok) {
++            for (int head = 0; head < heads && (int) out.size() < max_vectors; ++head) {
++                std::vector<float> vec(dim);
++                for (int d = 0; d < dim; ++d) {
++                    int64_t offset = 0;
++                    if (merged_kv) {
++                        offset =
++                                (head * dim + d) * t.nb[0] +
++                                tok * t.nb[1];
++                    } else {
++                        offset =
++                                d * t.nb[0] +
++                                head * t.nb[1] +
++                                tok * t.nb[2] +
++                                s * t.nb[3];
++                    }
++                    vec[d] = tensor_scalar_to_f32(base + offset, t.type, 0);
++                }
++                out.push_back(std::move(vec));
++            }
++        }
++    }
++
++    return out;
++}
++
++static bool turboquant_probe_eval(struct ggml_tensor * t, bool ask, void * user_data) {
++    auto * collector = static_cast<probe_collector *>(user_data);
++    const std::string normalized_name = probe_collector::normalize_name(t->name);
++    if (ask) {
++        if (!normalized_name.empty() && collector->seen_names.size() < 128) {
++            if (std::find(collector->seen_names.begin(), collector->seen_names.end(), normalized_name) == collector->seen_names.end()) {
++                collector->seen_names.push_back(normalized_name);
++            }
++        }
++        return collector->wants(t);
++    }
++
++    if (!collector->wants(t)) {
++        return false;
++    }
++
++    std::lock_guard<std::mutex> lock(collector->mutex);
++    captured_tensor * dst = nullptr;
++
++    if (collector->q_name == normalized_name && collector->q_capture.vectors.empty()) {
++        dst = &collector->q_capture;
++    } else if (collector->k_name == normalized_name && collector->k_capture.vectors.empty()) {
++        dst = &collector->k_capture;
++    } else {
++        return true;
++    }
++
++    dst->name = normalized_name;
++    for (int i = 0; i < 4; ++i) {
++        dst->ne[i] = t->ne[i];
++        dst->nb[i] = t->nb[i];
++    }
++    dst->type = t->type;
++
++    std::vector<char> raw(ggml_nbytes(t));
++    if (ggml_backend_buffer_is_host(t->buffer)) {
++        std::memcpy(raw.data(), t->data, raw.size());
++    } else {
++        ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
++    }
++    dst->raw = std::move(raw);
++    return true;
++}
++
++static void print_usage(int, char ** argv) {
++    std::fprintf(stderr,
++        "usage: %s -m model.gguf [-p prompt] [--layer N] [--bits N] [--qjl-dim N]\n"
++        "          [--max-vectors N] [--max-prompt-tokens N] [--probe-ctx N] [--cpu-only]\n",
++        argv[0]);
++}
++
++static bool parse_int_flag(const char * value, int & out) {
++    char * end = nullptr;
++    const long parsed = std::strtol(value, &end, 10);
++    if (end == nullptr || *end != '\0') {
++        return false;
++    }
++    out = static_cast<int>(parsed);
++    return true;
++}
++
++static std::vector<float> flatten_vectors(const std::vector<std::vector<float>> & vectors, int expected_dim) {
++    std::vector<float> out;
++    out.reserve(vectors.size() * std::max(expected_dim, 0));
++    for (const auto & vec : vectors) {
++        if ((int) vec.size() != expected_dim) {
++            throw std::runtime_error("TurboQuant vector flatten dimension mismatch");
++        }
++        out.insert(out.end(), vec.begin(), vec.end());
++    }
++    return out;
++}
++
++static std::pair<common_params, probe_args> parse_args(int argc, char ** argv) {
++    std::vector<char *> forwarded;
++    forwarded.reserve(argc);
++    forwarded.push_back(argv[0]);
++
++    probe_args probe;
++    for (int i = 1; i < argc; ++i) {
++        const std::string arg = argv[i];
++        auto need_value = [&](int & slot) {
++            if (i + 1 >= argc || !parse_int_flag(argv[++i], slot)) {
++                throw std::runtime_error("invalid value for " + arg);
++            }
++        };
++
++        if (arg == "--layer") {
++            need_value(probe.layer);
++        } else if (arg == "--bits") {
++            need_value(probe.bits);
++        } else if (arg == "--qjl-dim") {
++            need_value(probe.qjl_dim);
++        } else if (arg == "--max-vectors") {
++            need_value(probe.max_vectors);
++        } else if (arg == "--max-prompt-tokens") {
++            need_value(probe.max_prompt_tokens);
++        } else if (arg == "--probe-ctx") {
++            need_value(probe.probe_ctx);
++        } else if (arg == "--cpu-only") {
++            probe.use_gpu = false;
++            probe.use_cuda_exact = false;
++        } else if (arg == "--no-cuda-exact") {
++            probe.use_cuda_exact = false;
++        } else {
++            forwarded.push_back(argv[i]);
++        }
++    }
++
++    common_params params;
++    const int forwarded_argc = static_cast<int>(forwarded.size());
++    if (!common_params_parse(forwarded_argc, forwarded.data(), params, LLAMA_EXAMPLE_COMMON, print_usage)) {
++        throw std::runtime_error("failed to parse common llama.cpp arguments");
++    }
++
++    if (params.model.path.empty()) {
++        throw std::runtime_error("model path is required");
++    }
++
++    if (params.prompt.empty()) {
++        params.prompt =
++            "TurboQuant probe prompt. This prompt is intentionally long enough to exercise Q and K projections. "
++            "We want multiple semantically varied tokens about rockets, satellites, launch windows, orbital refueling, "
++            "AI agents, browsing, reasoning, and engineering tradeoffs so the probe captures realistic attention vectors.";
++    }
++
++    params.n_ctx = std::max(params.n_ctx, probe.probe_ctx);
++    params.n_batch = std::max(64, std::min(probe.probe_ctx, probe.max_prompt_tokens));
++    params.warmup = false;
++    params.cpuparams.n_threads = std::max(1, params.cpuparams.n_threads);
++    if (!probe.use_gpu) {
++        params.n_gpu_layers = 0;
++    }
++
++    return {params, probe};
++}
++
++static void run_probe(common_params & params, const probe_args & probe) {
++    probe_collector collector;
++    collector.q_name = string_format("Qcur-%d", probe.layer);
++    collector.k_name = string_format("Kcur-%d", probe.layer);
++    collector.max_vectors = probe.max_vectors;
++
++    params.cb_eval = turboquant_probe_eval;
++    params.cb_eval_user_data = &collector;
++
++    common_init();
++    llama_backend_init();
++    llama_numa_init(params.numa);
++
++    auto llama_init = common_init_from_params(params);
++    auto * ctx = llama_init->context();
++    auto * model = llama_init->model();
++    if (ctx == nullptr || model == nullptr) {
++        throw std::runtime_error("failed to initialize model/context");
++    }
++
++    const std::vector<llama_token> all_tokens = common_tokenize(ctx, params.prompt, true, params.parse_special);
++    if (all_tokens.size() < 8) {
++        throw std::runtime_error("prompt tokenization produced too few tokens for probing");
++    }
++    const int n_tokens = std::min<int>(probe.max_prompt_tokens, all_tokens.size());
++    std::vector<llama_token> tokens(all_tokens.begin(), all_tokens.begin() + n_tokens);
++
++    llama_memory_clear(llama_get_memory(ctx), true);
++    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
++        throw std::runtime_error("llama_decode failed during TurboQuant probe");
++    }
++    llama_synchronize(ctx);
++
++    if (collector.q_capture.raw.empty() || collector.k_capture.raw.empty()) {
++        std::string seen;
++        for (size_t i = 0; i < collector.seen_names.size(); ++i) {
++            if (i) {
++                seen += ", ";
++            }
++            seen += collector.seen_names[i];
++        }
++        throw std::runtime_error(
++            string_format("did not capture required tensors (wanted %s and %s). seen names: %s",
++                collector.q_name.c_str(), collector.k_name.c_str(), seen.c_str()));
++    }
++
++    if (collector.q_capture.vectors.empty()) {
++        collector.q_capture.vectors = unpack_attention_vectors(collector.q_capture, collector.max_vectors);
++    }
++    if (collector.k_capture.vectors.empty()) {
++        const int expected_head_dim = collector.q_capture.vectors.empty() ? 0 : static_cast<int>(collector.q_capture.vectors.front().size());
++        collector.k_capture.vectors = unpack_attention_vectors(collector.k_capture, collector.max_vectors, expected_head_dim);
++    }
++
++    if (collector.q_capture.vectors.front().size() != collector.k_capture.vectors.front().size()) {
++        throw std::runtime_error(
++            string_format("captured Q/K dims differ: q=%zu k=%zu (q ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%s; k ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%s)",
++                collector.q_capture.vectors.front().size(),
++                collector.k_capture.vectors.front().size(),
++                (long long) collector.q_capture.ne[0], (long long) collector.q_capture.ne[1], (long long) collector.q_capture.ne[2], (long long) collector.q_capture.ne[3],
++                collector.q_capture.nb[0], collector.q_capture.nb[1], collector.q_capture.nb[2], collector.q_capture.nb[3], ggml_type_name(collector.q_capture.type),
++                (long long) collector.k_capture.ne[0], (long long) collector.k_capture.ne[1], (long long) collector.k_capture.ne[2], (long long) collector.k_capture.ne[3],
++                collector.k_capture.nb[0], collector.k_capture.nb[1], collector.k_capture.nb[2], collector.k_capture.nb[3], ggml_type_name(collector.k_capture.type)));
++    }
++
++    const int dim = static_cast<int>(collector.k_capture.vectors.front().size());
++
++    turboquant_init_params tq_params;
++    tq_params.dim = dim;
++    tq_params.bits = probe.bits;
++    tq_params.qjl_dim = probe.qjl_dim;
++    tq_params.seed = 42;
++
++    turboquant_init_params prod_mse_params = tq_params;
++    prod_mse_params.bits = std::max(1, probe.bits - 1);
++
++    turboquant_mse mse_quant(tq_params);
++    turboquant_mse prod_mse_quant(prod_mse_params);
++    turboquant_prod prod_quant(tq_params);
++
++    const auto mse_metrics = turboquant_score_mse(mse_quant, collector.k_capture.vectors);
++    const auto prod_reference_mse_metrics = turboquant_score_mse(prod_mse_quant, collector.k_capture.vectors);
++    const auto prod_reference_ip_metrics = turboquant_score_mse_inner_products(
++        prod_mse_quant, collector.k_capture.vectors, collector.q_capture.vectors);
++    const auto prod_metrics = turboquant_score_prod(
++        prod_quant, collector.k_capture.vectors, collector.q_capture.vectors);
++    std::vector<float> queries_flat;
++    std::vector<float> dataset_flat;
++    std::vector<float> prod_mse_flat;
++    std::vector<int8_t> prod_qjl_signs_flat;
++    std::vector<float> prod_residual_norms;
++    if (probe.use_cuda_exact) {
++        queries_flat = flatten_vectors(collector.q_capture.vectors, dim);
++        dataset_flat = flatten_vectors(collector.k_capture.vectors, dim);
++        prod_mse_flat.reserve(size_t(collector.k_capture.vectors.size()) * dim);
++        prod_qjl_signs_flat.reserve(size_t(collector.k_capture.vectors.size()) * (probe.qjl_dim > 0 ? probe.qjl_dim : dim));
++        prod_residual_norms.reserve(collector.k_capture.vectors.size());
++        for (const auto & key : collector.k_capture.vectors) {
++            const auto compressed = prod_quant.quantize(key);
++            const auto dequantized = prod_quant.dequantize(compressed);
++            prod_mse_flat.insert(prod_mse_flat.end(), dequantized.begin(), dequantized.end());
++            prod_qjl_signs_flat.insert(prod_qjl_signs_flat.end(), compressed.qjl_signs.begin(), compressed.qjl_signs.end());
++            prod_residual_norms.push_back(compressed.residual_norm);
++        }
++    }
++    turboquant_metrics prod_cuda_metrics = {};
++    std::string prod_cuda_error;
++    const bool have_prod_cuda = probe.use_cuda_exact && turboquant_score_prod_cuda_raw(
++        queries_flat,
++        dataset_flat,
++        prod_mse_flat,
++        prod_qjl_signs_flat,
++        prod_residual_norms,
++        prod_quant.qjl_matrix(),
++        static_cast<int>(collector.q_capture.vectors.size()),
++        static_cast<int>(collector.k_capture.vectors.size()),
++        dim,
++        prod_quant.qjl_dim(),
++        prod_cuda_metrics,
++        prod_cuda_error);
++
++    std::string json = string_format(
++        "{"
++        "\"model\":\"%s\","
++        "\"layer\":%d,"
++        "\"tensor_q\":\"%s\","
++        "\"tensor_k\":\"%s\","
++        "\"prompt_tokens\":%d,"
++        "\"vector_dim\":%d,"
++        "\"captured_queries\":%zu,"
++        "\"captured_keys\":%zu,"
++        "\"bits\":%d,"
++        "\"prod_mse_bits\":%d,"
++        "\"qjl_dim\":%d,"
++        "\"mse_stage\":%s,"
++        "\"prod_reference_mse_stage\":%s,"
++        "\"prod_reference_ip_stage\":%s,"
++        "\"prod_stage\":%s",
++        params.model.path.c_str(),
++        probe.layer,
++        collector.q_capture.name.c_str(),
++        collector.k_capture.name.c_str(),
++        n_tokens,
++        dim,
++        collector.q_capture.vectors.size(),
++        collector.k_capture.vectors.size(),
++        probe.bits,
++        std::max(1, probe.bits - 1),
++        probe.qjl_dim > 0 ? probe.qjl_dim : dim,
++        turboquant_metrics_json(mse_metrics).c_str(),
++        turboquant_metrics_json(prod_reference_mse_metrics).c_str(),
++        turboquant_metrics_json(prod_reference_ip_metrics).c_str(),
++        turboquant_metrics_json(prod_metrics).c_str());
++
++    if (have_prod_cuda) {
++        json += string_format(
++            ",\"prod_cuda_stage\":%s",
++            turboquant_metrics_json(prod_cuda_metrics).c_str());
++    } else if (!prod_cuda_error.empty()) {
++        std::string escaped = prod_cuda_error;
++        size_t pos = 0;
++        while ((pos = escaped.find('"', pos)) != std::string::npos) {
++            escaped.replace(pos, 1, "\\\"");
++            pos += 2;
++        }
++        json += string_format(",\"prod_cuda_error\":\"%s\"", escaped.c_str());
++    }
++    json += "}\n";
++    std::printf("%s", json.c_str());
++
++    llama_backend_free();
++}
++
++} // namespace
++
++int main(int argc, char ** argv) {
++    try {
++        auto [params, probe] = parse_args(argc, argv);
++        run_probe(params, probe);
++        return 0;
++    } catch (const std::exception & exc) {
++        std::fprintf(stderr, "llama-turboquant-probe: %s\n", exc.what());
++        return 1;
++    }
++}
+diff --git a/tools/turboquant-probe/turboquant-probe-cuda.h b/tools/turboquant-probe/turboquant-probe-cuda.h
+new file mode 100644
+index 0000000..841a63c
+--- /dev/null
++++ b/tools/turboquant-probe/turboquant-probe-cuda.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++#include "../../common/turboquant.h"
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace llama_lab {
++
++bool turboquant_score_prod_cuda_raw(
++        const std::vector<float> & queries_flat,
++        const std::vector<float> & dataset_flat,
++        const std::vector<float> & mse_flat,
++        const std::vector<int8_t> & qjl_signs_flat,
++        const std::vector<float> & residual_norms,
++        const std::vector<float> & qjl_matrix,
++        int nq,
++        int nk,
++        int dim,
++        int qjl_dim,
++        turboquant_metrics & metrics_out,
++        std::string & error_out);
++
++} // namespace llama_lab

@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: TurboQuant Llama Lab
+message: If you use this project, please cite the repository and describe the exact patch/profile used.
+type: software
+authors:
+  - family-names: Vishvarupa
+    given-names: Project
+license: Apache-2.0
+abstract: Portable TurboQuant core, benchmark tooling, and llama.cpp-oriented integration patches for long-context experimentation.
