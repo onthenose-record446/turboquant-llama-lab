@@ -5,5 +5,7 @@ type: software
 authors:
   - family-names: Vishvarupa
     given-names: Project
+url: https://github.com/pp1840/turboquant-llama-lab
+repository-code: https://github.com/pp1840/turboquant-llama-lab
 license: Apache-2.0
 abstract: Portable TurboQuant core, benchmark tooling, and llama.cpp-oriented integration patches for long-context experimentation.
