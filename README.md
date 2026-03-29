@@ -7,6 +7,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache%202.0-1f6feb.svg)](LICENSE)
 ![Status: Experimental](https://img.shields.io/badge/status-experimental-cc7a00.svg)
 ![Focus: Long Context](https://img.shields.io/badge/focus-long--context-0b7285.svg)
+[![GitHub stars](https://img.shields.io/github/stars/pp1840/turboquant-llama-lab?style=social)](https://github.com/pp1840/turboquant-llama-lab/stargazers)
 
 Experimental TurboQuant implementation and integration path for a `llama.cpp`-style runtime.
 
@@ -154,6 +155,16 @@ See [LICENSE](LICENSE).
 - security policy: [SECURITY.md](SECURITY.md)
 - roadmap: [docs/ROADMAP.md](docs/ROADMAP.md)
 - benchmark highlights: [docs/BENCHMARK_HIGHLIGHTS.md](docs/BENCHMARK_HIGHLIGHTS.md)
+- launch kit: [docs/LAUNCH_KIT.md](docs/LAUNCH_KIT.md)
+
+## Help It Spread
+
+If this repo helps you:
+
+- star the repository
+- share the repo link with your benchmark notes
+- open an issue with reproducible results
+- contribute model-validation results for hardware other than the current Qwen-focused runs
 
 ## Quick Start
 
@@ -190,6 +201,7 @@ For a guided start, read:
 2. [docs/USAGE_PROFILES.md](docs/USAGE_PROFILES.md)
 3. [docs/VALIDATED_MODELS.md](docs/VALIDATED_MODELS.md)
 4. [docs/BENCHMARK_HIGHLIGHTS.md](docs/BENCHMARK_HIGHLIGHTS.md)
+5. [docs/LAUNCH_KIT.md](docs/LAUNCH_KIT.md)
 
 ## Current Status
 
